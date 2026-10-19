@@ -1,0 +1,42 @@
+# Install once with `uv run pre-commit install`; run manually with
+# `uv run pre-commit run --all-files`.
+# ruff and mypy run through `uv run`, so hooks use exactly the versions in
+# uv.lock and can never disagree with CI.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        exclude: ^uv\.lock$   # generated, and must be committed whatever its size
+      - id: detect-private-key
+
+  - repo: local
+    hooks:
+      - id: uv-lock
+        name: uv lock --check
+        entry: uv lock --check
+        language: system
+        files: ^(pyproject\.toml|uv\.lock)$
+        pass_filenames: false
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --fix
+        language: system
+        types_or: [python, pyi]
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
+        types_or: [python, pyi]
+      - id: mypy
+        name: mypy
+        entry: uv run mypy .
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false   # whole-project check, same as CI
