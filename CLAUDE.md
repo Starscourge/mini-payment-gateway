@@ -121,5 +121,6 @@ Payment state machine (status only moves forward; refunds never change it):
 - **Server-updated columns** (`updated_at` via `onupdate=func.now()`) need `__mapper_args__ = {"eager_defaults": True}` (see `Payment`). Without it, the value expires after flush and reading it under `AsyncSession` raises `MissingGreenlet`.
 - **Coverage needs `concurrency = ["thread", "greenlet"]`** (set in `pyproject.toml`). Without it, lines after a database `await` are falsely reported as never run.
 - **No FK indexes yet:** the spec's schema has none on foreign-key columns (e.g. `refunds.payment_id`, `ledger_entries.account_id`). Add each one in a migration alongside the first query that filters by that column.
+- **`astral-sh/setup-uv` has no floating major tags** (no `@v10`, unlike `actions/checkout@v7`). Pin an exact release such as `@v10.3.0`, and check that a tag exists before using it in CI.
 - **Listing routes:** in this FastAPI version, `app.routes` holds nested `_IncludedRouter` objects. Use `create_app().openapi()["paths"]` to list endpoints.
 - **`POST /v1/merchants`** is open when `ADMIN_TOKEN` is unset. Settings refuses to start with `ENVIRONMENT=production` and no token.
