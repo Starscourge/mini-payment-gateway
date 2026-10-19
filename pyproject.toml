@@ -1,0 +1,115 @@
+[project]
+name = "mini-payment-gateway"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.20.0",
+    "asyncpg>=0.32.0",
+    "fastapi[standard]>=0.146.0",
+    "httpx>=0.28.1",
+    "pydantic>=2.14.1",
+    "pydantic-settings>=2.16.0",
+    "redis>=8.1.0",
+    "sqlalchemy[asyncio]>=2.1.5",
+    "structlog>=26.1.0",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "locust>=2.46.7",
+    "mypy>=2.4.0",
+    "pre-commit>=4.7.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.17.1",
+]
+
+# --- Tests ------------------------------------------------------------------
+
+[tool.pytest]
+minversion = "9.0"                # native [tool.pytest] tables need pytest 9+
+testpaths = ["tests"]
+pythonpath = ["."]                # lets tests `import app` without packaging the project
+addopts = ["-ra", "--import-mode=importlib"]
+strict = true                     # strict markers, config, xfail and parametrize IDs
+filterwarnings = ["error"]        # surfaces "coroutine was never awaited" and deprecations
+# Every async test and fixture runs on one session-wide event loop, so a
+# session-scoped async engine (and its asyncpg pool) can be shared across tests.
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+# SQLAlchemy's async layer runs on greenlets; without this, lines after a DB await are
+# reported as never run.
+concurrency = ["thread", "greenlet"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError"]
+
+# --- Lint and format --------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+# ruff also formats Python blocks inside Markdown; keep the spec's hand-aligned samples as written
+extend-exclude = ["*Project Spec.md"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",  # pycodestyle
+    "F",       # pyflakes
+    "I",       # import sorting
+    "B",       # bugbear
+    "UP",      # pyupgrade
+    "SIM",     # simplify
+    "C4",      # comprehensions
+    "RUF",     # ruff-specific
+    "PT",      # pytest style
+    "T20",     # no print(): log with structlog
+    "S",       # bandit security checks
+    "ASYNC",   # blocking calls inside async functions
+    "DTZ",     # naive datetimes (the schema is all TIMESTAMPTZ)
+    "FAST",    # FastAPI-specific checks
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S311"]  # asserts, fake secrets, non-crypto random
+"mock_bank/**" = ["S311"]                       # random delays and failure rate are the point
+"loadtest/**" = ["S311"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = [
+    "fastapi.Depends", "fastapi.Query", "fastapi.Header", "fastapi.Path", "fastapi.Body",
+]
+
+# --- Type checking ----------------------------------------------------------
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+explicit_package_bases = true     # tests/unit and tests/integration may share file names
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false     # bodies are still checked (check_untyped_defs)
+disallow_incomplete_defs = false
+disallow_untyped_calls = false    # untyped tests may call untyped helpers
+
+[[tool.mypy.overrides]]
+module = ["asyncpg.*"]            # ships no type hints; normally used only through SQLAlchemy
+ignore_missing_imports = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
