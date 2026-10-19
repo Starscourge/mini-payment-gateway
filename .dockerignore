@@ -1,0 +1,21 @@
+# The image needs only app code, migrations and the dependency manifests.
+.git
+.github
+.venv
+**/__pycache__
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.coverage
+.coverage.*
+htmlcov
+.env
+.env.*
+.claude
+tests
+docs
+loadtest
+*.md
+*.docx
+*:Zone.Identifier
+.pre-commit-config.yaml
