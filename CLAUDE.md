@@ -6,7 +6,7 @@ A FastAPI backend that simulates a small payment gateway (INR only, no real mone
 
 ## Current status
 
-**Milestone 1 (Foundation) is built.** It covers all 10 tables and the first migration, merchants and API keys, create/get/list payments with the state machine, health checks, Docker Compose (api, postgres, redis) and CI. Not yet verified: CI on GitHub (nothing has been pushed).
+**Milestone 1 (Foundation) is built.** It covers all 10 tables and the first migration, merchants and API keys, create/get/list payments with the state machine, health checks, Docker Compose (api, postgres, redis) and CI. CI is green on GitHub (`Starscourge/mini-payment-gateway`, a public repo).
 
 **Next is milestone 2 (Money movement):**
 - `mock_bank/` and the worker, with their Compose services
