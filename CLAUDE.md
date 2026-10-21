@@ -6,11 +6,9 @@ A FastAPI backend that simulates a small payment gateway (INR only, no real mone
 
 ## Current status
 
-**Milestones 1 (Foundation) and 2 (Money movement) are built.** Milestone 1 covers all 10 tables, merchants and API keys, create/get/list payments with the state machine, health checks, Docker Compose and CI. Milestone 2 adds `POST /confirm` with the outbox, the worker (`bank_submit` handler and expiry sweep), the mock bank, signed bank callbacks, ledger postings and `GET /v1/balance`, and runs end to end in `docker compose up`. Both are merged into `main`, and CI is green on GitHub (`Starscourge/mini-payment-gateway`, a public repo).
+**Milestones 1 (Foundation), 2 (Money movement) and 3 (Correctness under pressure) are built.** Milestone 1 covers all 10 tables, merchants and API keys, create/get/list payments with the state machine, health checks, Docker Compose and CI. Milestone 2 adds `POST /confirm` with the outbox, the worker (`bank_submit` handler and expiry sweep), the mock bank, signed bank callbacks, ledger postings and `GET /v1/balance`, and runs end to end in `docker compose up`. Both are merged into `main`, and CI is green on GitHub (`Starscourge/mini-payment-gateway`, a public repo). Milestone 3 (branch `milestone-3-correctness`) adds required `Idempotency-Key`s on create, confirm and refunds; refunds (`POST`/`GET /v1/payments/{id}/refunds`) under row locks; and concurrency, duplicate-callback and tenant-isolation tests that pass 50 runs in a row.
 
-**Next is milestone 3 (Correctness under pressure):** idempotency keys on create, confirm and refunds; refunds with row locks (`app/services/refunds.py`, posting through `ledger.post` and queuing `refund.succeeded` events); concurrency, duplicate-callback and tenant-isolation tests that pass 50 runs in a row.
-
-No endpoint requires an `Idempotency-Key` yet; that arrives with milestone 3. Webhook outbox rows are already queued but nothing delivers them until milestone 4, so they sit `pending`. Follow the spec's "Project structure"; design choices so far are in `docs/decisions.md` (callbacks match by `payment_id`, a change agreed with the owner: decision 11). Update this section as milestones complete.
+**Next is milestone 4 (Notifications and protection):** webhook delivery (a `webhook` handler in the worker: sign with the merchant's secret via `app/security/signing.py`, log each attempt in `webhook_deliveries`, reuse the outbox backoff and dead-lettering), `GET /v1/webhook-events` and `POST .../redeliver`, the SSRF guard on webhook URLs, and Redis rate limiting. `payment.*` and `refund.succeeded` events are already queued and sit `pending` until then. Follow the spec's "Project structure"; design choices so far are in `docs/decisions.md` (callbacks match by `payment_id`, a change agreed with the owner: decision 11). Update this section as milestones complete.
 
 ## Commands
 
@@ -39,7 +37,7 @@ docker compose exec postgres psql -U gateway gateway   # no psql/redis-cli on th
 The test database is `gateway_test`. The test suite creates it and rebuilds its schema from the migrations on every run.
 
 ```bash
-for i in $(seq 50); do uv run pytest tests/integration/test_refunds.py -q -x || break; done
+for i in $(seq 50); do uv run pytest tests/integration/test_concurrency.py -q -x || break; done
 ```
 
 The loop above is how concurrency tests are vetted: they must pass 50 runs in a row before they are trusted. Don't run two pytest processes at once: each run drops and rebuilds the `gateway_test` schema.
@@ -53,7 +51,8 @@ Three processes we write (API, worker, mock bank) plus PostgreSQL 16 and Redis 7
 - **No job-queue library** (Celery, RQ, arq, Dramatiq). The Postgres outbox is a deliberate design choice.
 - **The mock bank is a separate FastAPI app** (`mock_bank/`) so failures and duplicate callbacks happen over a real network. It is configured by `BANK_*` env vars (decline, duplicate-callback and lost-response rates, delays) and shares only `app/security/signing.py` with the gateway. In tests, the worker talks to a scripted fake (`httpx.MockTransport`, see `FakeBank` in `tests/integration/test_worker.py`); `tests/integration/test_end_to_end.py` runs the real mock bank in-process.
 - **The worker** claims one outbox row per transaction (`FOR UPDATE SKIP LOCKED`), runs its handler inside a savepoint, records the outcome and commits. Handlers are registered per `OutboxKind` in `app/worker/main.py`; it claims only kinds it has handlers for. Failures retry with backoff (30 s doubling to 6 h, ±20% jitter) and become `dead` after 10 attempts.
-- **Layering:** routers in `app/api/` stay thin. Business logic lives in `app/services/`, which must never import FastAPI, so the worker can reuse it and tests can call it directly. Services `flush()`, routers `commit()` (milestone 3 hands the transaction to the idempotency layer).
+- **Layering:** routers in `app/api/` stay thin. Business logic lives in `app/services/`, which must never import FastAPI, so the worker can reuse it and tests can call it directly. Services `flush()` and never commit. Endpoints that take an `Idempotency-Key` (`IdempotencyDep`) finish with `return await idempotency.complete(response, status_code=...)`, which stores the response and commits; other endpoints call `session.commit()` themselves.
+- **Idempotency** (`app/api/idempotency.py`, `app/services/idempotency.py`): the dependency claims `(merchant_id, key)` with `INSERT ... ON CONFLICT DO NOTHING` in the request's transaction. A concurrent duplicate waits on that row (bounded by a 5 s `lock_timeout`, then 409 `idempotency_key_in_use`). A completed repeat is answered by raising `IdempotentReplay` with the stored response (plus `Idempotent-Replayed: true`); the same key with a different method, path or canonical JSON body is 422. A failed request stores nothing, so its key stays free. The worker purges keys after 24 h.
 - **Map of `app/`:**
   - `main.py`: `create_app()` factory; run with `--factory`
   - `config.py`: Settings
@@ -61,12 +60,15 @@ Three processes we write (API, worker, mock bank) plus PostgreSQL 16 and Redis 7
   - `logging.py`: structlog setup, plus the request-ID middleware that also turns crashes into 500s
   - `errors.py`: every error code the API returns
   - `ids.py`: prefixed public IDs
-  - `api/deps.py`: session and settings dependencies, `CurrentMerchant` auth
+  - `api/deps.py`: session and settings dependencies, `CurrentMerchant` auth, and `PaymentPathId` (the parsed `{payment_id}` path parameter; declare it after `CurrentMerchant`, so a request without credentials gets 401 rather than 404)
   - `api/error_handlers.py`: renders errors in the one shape
+  - `api/idempotency.py`: `IdempotencyDep` and `Idempotency.complete()`
   - `api/bank_callbacks.py`: `POST /internal/bank/callback`, authenticated by HMAC, not an API key
   - `services/payments.py`: the state machine and every flow that moves it (confirm, bank result, expiry)
   - `services/ledger.py`: balanced postings, lazily created accounts, balances
-  - `services/outbox.py`: enqueue, `claim_next`, retry bookkeeping
+  - `services/refunds.py`: refunds under the payment's row lock
+  - `services/idempotency.py`: claim, replay, save and purge keys
+  - `services/outbox.py`: enqueue (bank submissions, `payment.*`/`refund.*` events), `claim_next`, retry bookkeeping
   - `security/signing.py`: `X-Signature` sign and verify (bank callbacks now, webhooks in milestone 4)
   - `worker/main.py`: the polling loop and graceful shutdown; `worker/handlers.py`: what each event does
 
@@ -105,16 +107,18 @@ Settlement: `POST /confirm` sets `processing` and queues `bank_submit` → the w
 
 - Tests run against real Postgres and Redis (Docker). **Never SQLite**: row locks and `SKIP LOCKED` behave differently.
 - Call the app in-process with `httpx.AsyncClient(transport=ASGITransport(app=app))`.
-- **Rolled-back transactions:** most tests run inside a transaction that rolls back, and `create_savepoint` turns the app's `commit()` into a savepoint release (fixtures are in `tests/conftest.py`). Concurrency tests need real commits, so they will need their own engine-level fixture that truncates tables afterwards.
+- **Rolled-back transactions:** most tests run inside a transaction that rolls back, and `create_savepoint` turns the app's `commit()` into a savepoint release (fixtures are in `tests/conftest.py`). Concurrency tests need real commits: they use `live_client` (an app with its own engine) and `committed_sessions` (which truncates every table afterwards), and fire requests together with `asyncio.gather` (see `tests/integration/test_concurrency.py`).
 - **`now()` is fixed within a test:** it doesn't change inside one transaction, so rows created through the API in one test share a `created_at`. When order matters, insert rows through `db_session` with explicit timestamps (see `insert_payments` in `tests/integration/test_payments.py`).
 - **Fixtures:**
   - `client` calls the app
   - `merchant` / `make_merchant()` create merchants through the API (`.headers` holds their bearer auth)
   - `make_payment(owner=None, confirm=False, **fields)` creates (and optionally confirms) a payment through the API
+  - `live_client` calls an app that really commits, for concurrency tests
   - `send_bank_callback(payment_id, status, ...)` posts a callback signed with the test bank secret; overrides make it invalid
   - `db_session` is the same session the app uses
   - `committed_sessions` is a session factory that really commits, for tests that need several connections (row locks, `SKIP LOCKED`); it truncates every table afterwards
-  - `tests/helpers.py`: `to_uuid("pay_...")` for calling services directly with a public ID
+  - `tests/helpers.py` holds plain helpers that take the client as an argument (`create_merchant`, `create_payment`, `confirm_payment`, `post_bank_callback`, `settle_payment`), plus `to_uuid("pay_...")` and `idempotency_key()`
+- **Every POST to create, confirm or refund needs an `Idempotency-Key`:** use `headers=merchant.headers | idempotency_key()` (a fresh key), or pass a fixed key to test replays.
 - **A failed request rolls back the shared test session**, including anything the test inserted through `db_session` without committing. Commit test setup first (`await db_session.commit()`, a savepoint release here) when the request under test is expected to fail.
 - The `db_session` fixture asserts the ledger invariant (every transaction sums to zero) after every integration test.
 - Coverage target is about 85% on `app/services/`.
@@ -129,9 +133,9 @@ Settlement: `POST /confirm` sets `processing` and queues `bank_submit` → the w
   - CHECK constraint changes, which autogenerate doesn't detect
   - the partial index `outbox_due` (`postgresql_where`)
   - `UNIQUE NULLS NOT DISTINCT` (`postgresql_nulls_not_distinct=True`)
-- **Server-updated columns** (`updated_at` via `onupdate=func.now()`) need `__mapper_args__ = {"eager_defaults": True}` (see `Payment`). Without it, the value expires after flush and reading it under `AsyncSession` raises `MissingGreenlet`.
+- **Server-set columns that are read after insert or update** (`updated_at` via `onupdate=func.now()`, or a `created_at` returned in a response) need `__mapper_args__ = {"eager_defaults": True}` (see `Payment` and `Refund`). Without it, the value isn't loaded after flush, and reading it under `AsyncSession` raises `MissingGreenlet`.
 - **Coverage needs `concurrency = ["thread", "greenlet"]`** (set in `pyproject.toml`). Without it, lines after a database `await` are falsely reported as never run.
-- **No FK indexes yet:** the spec's schema has none on foreign-key columns (e.g. `refunds.payment_id`, `ledger_entries.account_id`). Add each one in a migration alongside the first query that filters by that column.
+- **FK indexes are added as queries need them:** the spec's schema has none on foreign-key columns. So far `ledger_entries.account_id` and `refunds.payment_id` are indexed; add others in a migration alongside the first query that filters by that column.
 - **`astral-sh/setup-uv` has no floating major tags** (no `@v10`, unlike `actions/checkout@v7`). Pin an exact release such as `@v10.3.0`, and check that a tag exists before using it in CI.
 - **Listing routes:** in this FastAPI version, `app.routes` holds nested `_IncludedRouter` objects. Use `create_app().openapi()["paths"]` to list endpoints.
 - **`POST /v1/merchants`** is open when `ADMIN_TOKEN` is unset. Settings refuses to start with `ENVIRONMENT=production` and no token.
@@ -140,3 +144,5 @@ Settlement: `POST /confirm` sets `processing` and queues `bank_submit` → the w
 - **`SUM(bigint)` is `NUMERIC`** in Postgres and comes back as `Decimal`. Cast sums of money back to `BigInteger` (see `ledger.merchant_balance`).
 - **`OutboxEvent` has no `eager_defaults`:** after inserting one, its server-set columns (`created_at`, `next_attempt_at`) aren't loaded, and reading them raises `MissingGreenlet`. Re-select it instead (with `populate_existing=True` if it's already in the session).
 - **Compose names the bank service `mock-bank`** (underscores aren't valid in hostnames), so `BANK_URL` is `http://mock-bank:8001`.
+- **Idempotent replays aren't byte-identical:** responses are stored as `JSONB`, which reorders object keys. Compare replays as parsed JSON (`response.json()`), not `response.text`.
+- **`lock_timeout` also covers unique-index waits** (SQLSTATE `55P03`, `exc.orig.sqlstate` on a SQLAlchemy `DBAPIError`). That is what bounds an idempotency duplicate's wait.
