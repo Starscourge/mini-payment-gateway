@@ -1,4 +1,4 @@
-"""What the worker does: one handler per outbox kind, plus the expiry sweep.
+"""What the worker does: one handler per outbox kind, plus periodic sweeps.
 
 Handlers make the HTTP call and then write through the services, inside the transaction that
 holds the event's row lock. They never commit; the worker loop does.
@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import ids
 from app.models import OutboxEvent
 from app.schemas.bank import BankSubmissionAccepted
+from app.services import idempotency as idempotency_service
 from app.services import payments as payments_service
 
 log = structlog.get_logger()
@@ -61,3 +62,12 @@ async def expire_payments(session: AsyncSession) -> int:
     if expired:
         log.info("payments_expired", count=len(expired))
     return len(expired)
+
+
+async def purge_idempotency_keys(session: AsyncSession) -> int:
+    """Delete one batch of idempotency keys past their 24-hour retention, and commit."""
+    purged = await idempotency_service.purge_expired(session)
+    await session.commit()
+    if purged:
+        log.info("idempotency_keys_purged", count=purged)
+    return purged

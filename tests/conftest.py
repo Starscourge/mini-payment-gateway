@@ -6,10 +6,8 @@ inside a transaction that is rolled back afterwards, so tests never see each oth
 Unit tests use none of these fixtures and run without Docker.
 """
 
-import json
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +30,7 @@ from app.api.deps import get_session
 from app.config import Settings
 from app.main import create_app
 from app.models import Base, LedgerEntry
-from app.security.signing import signature_header
+from tests.helpers import MerchantAccount, create_merchant, create_payment, post_bank_callback
 
 ROOT = Path(__file__).resolve().parent.parent
 TEST_DATABASE_URL = os.environ.get(
@@ -168,33 +166,13 @@ async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
         yield client
 
 
-@dataclass(frozen=True)
-class MerchantAccount:
-    id: str
-    api_key: str
-    api_key_id: str
-    webhook_secret: str
-
-    @property
-    def headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.api_key}"}
-
-
 MerchantFactory = Callable[..., Awaitable[MerchantAccount]]
 
 
 @pytest.fixture
 def make_merchant(client: AsyncClient) -> MerchantFactory:
     async def make(name: str = "Acme Stores") -> MerchantAccount:
-        response = await client.post("/v1/merchants", json={"name": name})
-        assert response.status_code == 201, response.text
-        body = response.json()
-        return MerchantAccount(
-            id=body["id"],
-            api_key=body["api_key"]["key"],
-            api_key_id=body["api_key"]["id"],
-            webhook_secret=body["webhook_secret"],
-        )
+        return await create_merchant(client, name)
 
     return make
 
@@ -215,17 +193,7 @@ def make_payment(client: AsyncClient, merchant: MerchantAccount) -> PaymentFacto
     async def make(
         owner: MerchantAccount | None = None, *, confirm: bool = False, **fields: Any
     ) -> dict[str, Any]:
-        headers = (owner or merchant).headers
-        response = await client.post(
-            "/v1/payments", json={"amount_paise": 50_000} | fields, headers=headers
-        )
-        assert response.status_code == 201, response.text
-        payment: dict[str, Any] = response.json()
-        if confirm:
-            response = await client.post(f"/v1/payments/{payment['id']}/confirm", headers=headers)
-            assert response.status_code == 200, response.text
-            payment = response.json()
-        return payment
+        return await create_payment(client, owner or merchant, confirm=confirm, **fields)
 
     return make
 
@@ -238,31 +206,22 @@ def send_bank_callback(client: AsyncClient, bank_secret: str) -> CallbackSender:
     """POST a bank callback signed the way the bank signs it. Overrides make it invalid."""
 
     async def send(
-        payment_id: str,
-        status: str = "succeeded",
-        *,
-        bank_reference: str = "bnk_test_1",
-        failure_reason: str | None = None,
-        body: bytes | None = None,
-        secret: str | None = None,
-        timestamp: int | None = None,
+        payment_id: str, *args: Any, secret: str | None = None, **kwargs: Any
     ) -> Response:
-        raw = (
-            body
-            or json.dumps(
-                {
-                    "payment_id": payment_id,
-                    "bank_reference": bank_reference,
-                    "status": status,
-                    "failure_reason": failure_reason,
-                }
-            ).encode()
-        )
-        signature = signature_header(secret or bank_secret, raw, timestamp=timestamp)
-        return await client.post(
-            "/internal/bank/callback",
-            content=raw,
-            headers={"Content-Type": "application/json", "X-Signature": signature},
-        )
+        return await post_bank_callback(client, secret or bank_secret, payment_id, *args, **kwargs)
 
     return send
+
+
+@pytest.fixture
+async def live_client(
+    settings: Settings, committed_sessions: async_sessionmaker[AsyncSession]
+) -> AsyncIterator[AsyncClient]:
+    """A client for an app with its own engine, so every request uses its own connection and
+    really commits. For concurrency tests: requests sent at once genuinely race in Postgres.
+    Depends on committed_sessions, which empties the tables afterwards."""
+    app = create_app(settings)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        yield client
+    await app.state.redis.aclose()
+    await app.state.engine.dispose()

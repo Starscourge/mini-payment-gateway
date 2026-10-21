@@ -1,12 +1,10 @@
-import uuid
 from datetime import timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Query
 
-from app import ids
-from app.api.deps import CurrentMerchant, SessionDep, SettingsDep
-from app.errors import PaymentNotFound
+from app.api.deps import CurrentMerchant, PaymentPathId, SessionDep, SettingsDep
+from app.api.idempotency import IdempotencyDep
 from app.models import PaymentStatus
 from app.schemas.common import error_responses
 from app.schemas.payments import CreatePaymentRequest, PaymentList, PaymentOut
@@ -15,12 +13,13 @@ from app.services import payments as payments_service
 router = APIRouter(prefix="/v1/payments", tags=["Payments"], responses=error_responses(401))
 
 
-@router.post("", status_code=201, responses=error_responses(400, 422))
+@router.post("", status_code=201, responses=error_responses(400, 409, 422))
 async def create_payment(
     body: CreatePaymentRequest,
     merchant: CurrentMerchant,
     session: SessionDep,
     settings: SettingsDep,
+    idempotency: IdempotencyDep,
 ) -> PaymentOut:
     """Create a payment order. It expires if not confirmed within PAYMENT_TTL_MINUTES."""
     payment = await payments_service.create_payment(
@@ -31,23 +30,25 @@ async def create_payment(
         description=body.description,
         ttl=timedelta(minutes=settings.payment_ttl_minutes),
     )
-    await session.commit()
-    return PaymentOut.model_validate(payment)
+    return await idempotency.complete(PaymentOut.model_validate(payment), status_code=201)
 
 
-@router.get("/{payment_id}", responses=error_responses(404, 422))
+@router.get("/{payment_id}", responses=error_responses(404))
 async def get_payment(
-    payment_id: str, merchant: CurrentMerchant, session: SessionDep
+    merchant: CurrentMerchant, payment_id: PaymentPathId, session: SessionDep
 ) -> PaymentOut:
     payment = await payments_service.get_payment(
-        session, merchant_id=merchant.merchant_id, payment_id=_parse_payment_id(payment_id)
+        session, merchant_id=merchant.merchant_id, payment_id=payment_id
     )
     return PaymentOut.model_validate(payment)
 
 
-@router.post("/{payment_id}/confirm", responses=error_responses(404, 409))
+@router.post("/{payment_id}/confirm", responses=error_responses(400, 404, 409, 422))
 async def confirm_payment(
-    payment_id: str, merchant: CurrentMerchant, session: SessionDep
+    merchant: CurrentMerchant,
+    payment_id: PaymentPathId,
+    session: SessionDep,
+    idempotency: IdempotencyDep,
 ) -> PaymentOut:
     """Simulate the customer approving the payment.
 
@@ -56,10 +57,9 @@ async def confirm_payment(
     `created` and not yet expired.
     """
     payment = await payments_service.confirm_payment(
-        session, merchant_id=merchant.merchant_id, payment_id=_parse_payment_id(payment_id)
+        session, merchant_id=merchant.merchant_id, payment_id=payment_id
     )
-    await session.commit()
-    return PaymentOut.model_validate(payment)
+    return await idempotency.complete(PaymentOut.model_validate(payment), status_code=200)
 
 
 @router.get("", responses=error_responses(400, 422))
@@ -77,11 +77,3 @@ async def list_payments(
     return PaymentList(
         data=[PaymentOut.model_validate(payment) for payment in payments], next_cursor=next_cursor
     )
-
-
-def _parse_payment_id(raw: str) -> uuid.UUID:
-    # A malformed ID gets the same 404 as an unknown one.
-    payment_id = ids.parse_id(ids.PAYMENT, raw)
-    if payment_id is None:
-        raise PaymentNotFound()
-    return payment_id

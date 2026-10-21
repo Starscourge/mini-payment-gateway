@@ -5,6 +5,7 @@ from sqlalchemy import select
 
 from app.ids import MERCHANT, PAYMENT, parse_id
 from app.models import OutboxEvent, OutboxKind, OutboxStatus, Payment, PaymentStatus
+from tests.helpers import confirm_payment, idempotency_key
 
 
 async def outbox_rows(db_session):
@@ -32,7 +33,7 @@ async def test_confirm_moves_payment_to_processing_and_queues_bank_submission(
 ):
     payment = await make_payment(amount_paise=12_345)
 
-    response = await client.post(f"/v1/payments/{payment['id']}/confirm", headers=merchant.headers)
+    response = await confirm_payment(client, merchant, payment["id"])
 
     assert response.status_code == 200
     assert response.json()["status"] == "processing"
@@ -48,7 +49,7 @@ async def test_confirming_twice_is_a_conflict_and_queues_one_submission(
 ):
     payment = await make_payment(confirm=True)
 
-    response = await client.post(f"/v1/payments/{payment['id']}/confirm", headers=merchant.headers)
+    response = await confirm_payment(client, merchant, payment["id"])
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "invalid_state_transition"
@@ -62,7 +63,7 @@ async def test_payment_past_expiry_cannot_be_confirmed_even_before_the_sweep(
         db_session, merchant, expires_at=datetime.now(UTC) - timedelta(seconds=1)
     )
 
-    response = await client.post(f"/v1/payments/{payment_id}/confirm", headers=merchant.headers)
+    response = await confirm_payment(client, merchant, payment_id)
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "payment_expired"
@@ -81,7 +82,7 @@ async def test_expired_payment_cannot_be_confirmed(client, merchant, db_session)
         expires_at=datetime.now(UTC) - timedelta(minutes=1),
     )
 
-    response = await client.post(f"/v1/payments/{payment_id}/confirm", headers=merchant.headers)
+    response = await confirm_payment(client, merchant, payment_id)
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "payment_expired"
@@ -93,7 +94,7 @@ async def test_another_merchants_payment_cannot_be_confirmed(
     other = await make_merchant("Other Co")
     theirs = await make_payment()
 
-    response = await client.post(f"/v1/payments/{theirs['id']}/confirm", headers=other.headers)
+    response = await confirm_payment(client, other, theirs["id"])
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "payment_not_found"
@@ -102,12 +103,12 @@ async def test_another_merchants_payment_cannot_be_confirmed(
 
 @pytest.mark.parametrize("payment_id", ["nope", "key_" + "0" * 32, "pay_" + "0" * 32])
 async def test_unknown_payment_cannot_be_confirmed(client, merchant, payment_id):
-    response = await client.post(f"/v1/payments/{payment_id}/confirm", headers=merchant.headers)
+    response = await confirm_payment(client, merchant, payment_id)
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "payment_not_found"
 
 
 async def test_confirm_requires_an_api_key(client, make_payment):
     payment = await make_payment()
-    response = await client.post(f"/v1/payments/{payment['id']}/confirm")
+    response = await client.post(f"/v1/payments/{payment['id']}/confirm", headers=idempotency_key())
     assert response.status_code == 401

@@ -34,6 +34,10 @@ class Conflict(AppError):
     status_code = 409
 
 
+class UnprocessableEntity(AppError):
+    status_code = 422
+
+
 class PaymentNotFound(NotFound):
     def __init__(self) -> None:
         super().__init__("payment_not_found", "No payment with that ID.")

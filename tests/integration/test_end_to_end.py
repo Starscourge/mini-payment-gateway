@@ -17,6 +17,7 @@ from app.models import OutboxEvent, OutboxKind
 from app.worker import main as worker
 from app.worker.handlers import submit_to_bank
 from mock_bank.main import BankSettings, create_app
+from tests.helpers import confirm_payment
 
 
 class Gateway:
@@ -95,7 +96,7 @@ async def test_payment_goes_from_created_to_succeeded(
     payment = await make_payment(amount_paise=50_000)
     assert payment["status"] == "created"
 
-    response = await client.post(f"/v1/payments/{payment['id']}/confirm", headers=merchant.headers)
+    response = await confirm_payment(client, merchant, payment["id"])
     assert response.json()["status"] == "processing"
 
     assert await worker.process_next_event(db_session, handlers)

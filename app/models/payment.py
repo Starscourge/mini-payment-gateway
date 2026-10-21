@@ -62,9 +62,12 @@ Index(
 class Refund(Base):
     __tablename__ = "refunds"
     __table_args__ = (CheckConstraint("amount_paise > 0", name="amount_positive"),)
+    # created_at is server-set and returned in the API response (see Payment).
+    __mapper_args__ = {"eager_defaults": True}  # noqa: RUF012
 
     id: Mapped[UUIDPrimaryKey]
-    payment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("payments.id"))
+    # Indexed for listing a payment's refunds.
+    payment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("payments.id"), index=True)
     amount_paise: Mapped[int] = mapped_column(BigInteger)
     status: Mapped[str] = mapped_column(server_default="succeeded")
     created_at: Mapped[CreatedAt]
