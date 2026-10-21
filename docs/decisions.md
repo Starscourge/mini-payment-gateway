@@ -189,3 +189,73 @@ backoff, signs each attempt with a fresh timestamp, and treats `payment_id` as a
 key. It shares only the signing helper with the gateway. In tests, a scripted fake bank
 (`httpx.MockTransport`) replaces it for the worker, and the real mock bank runs in-process for
 the end-to-end tests.
+
+## Milestone 3: Correctness under pressure (2026-10-21)
+
+### 24. Idempotency is a dependency, and it owns the transaction
+
+`POST /v1/payments`, `/confirm` and `/refunds` declare `IdempotencyDep`
+(`app/api/idempotency.py`). Before the handler runs, it requires the `Idempotency-Key` header
+and claims the key in the request's transaction. A repeat of a completed request never reaches
+the handler: the dependency raises `IdempotentReplay`, which an exception handler turns into the
+stored response with an `Idempotent-Replayed: true` header. The handler finishes with
+`idempotency.complete(response, status_code=...)`, which saves the response in the key's row
+and commits. So the stored response and the business writes commit together or not at all,
+and services still only flush. Raising for a replay is control flow rather than an error, but
+it keeps every handler free of replay branches, the same way a failed auth check skips the
+handler.
+
+### 25. Only completed requests are remembered
+
+A request that fails (validation, 404, 409 and so on) rolls back everything, including its
+key, so the same key can be retried and will run afresh. A failed request had no effect, so
+there is nothing to protect from running twice. This is the spec's flow; Stripe instead stores
+some errors too. One consequence: a refund rejected because the payment hadn't succeeded yet
+can be retried with the same key once it has.
+
+### 26. Concurrent duplicates wait on the key, with a 5-second `lock_timeout`
+
+Ten requests with one key sent together: the first inserts the key, and the others' `INSERT
+... ON CONFLICT DO NOTHING` blocks on the primary key until the first commits. Then each
+inserts nothing, re-reads the row (a fresh snapshot under READ COMMITTED) and replays the
+stored response. If the first rolls back, a waiter's insert succeeds and it runs instead.
+`SET LOCAL lock_timeout` bounds that wait to 5 s, after which the duplicate gets 409
+`idempotency_key_in_use` and can retry. The timeout is reset straight after the insert, so
+waits on payment row locks later in the request aren't affected. (Verified first: Postgres
+applies `lock_timeout` to unique-index waits too, raising SQLSTATE `55P03`.)
+
+### 27. "The same request" is method, path and canonical JSON body
+
+The request hash is SHA-256 over the method, path and body, with a JSON body re-serialised with
+sorted keys and no whitespace first. A client that rebuilds an identical request on retry still
+matches, while any changed value is a different request (422 `idempotency_key_reused`). The
+path is included, so one key can't be reused across endpoints or payments. Keys are scoped to
+the merchant (the primary key is `(merchant_id, key)`), and the worker purges keys older than
+24 hours, after which a key can be reused.
+
+### 28. Replays are the same JSON, not the same bytes
+
+The stored response lives in a `JSONB` column (as in the spec), and `JSONB` stores object keys
+in its own order (by length, then bytes). A replay therefore has the same keys and values as
+the original, but possibly in a different order. JSON clients compare parsed objects, so this
+is invisible to them; a byte-identical replay would need a `TEXT` column instead.
+
+### 29. Refunds: the spec's row-lock flow, plus "omit the amount for a full refund"
+
+`create_refund` locks the payment (`FOR UPDATE`), checks that it succeeded and how much is
+left, raises `refunded_paise`, inserts the refund, posts the reversing ledger entries (debit
+`merchant_balance`, credit `bank_clearing`) and queues `refund.succeeded`, all in one
+transaction. Parallel refunds take turns on the lock, so each sees the previous one's
+`refunded_paise`, and the CHECK constraint backs this up. Omitting `amount_paise` (or the
+whole body) refunds everything still refundable, the usual API for "refund all". Refunds
+settle immediately; routing them through the bank is a stretch goal.
+
+### 30. Concurrency tests use an app that really commits
+
+Most tests share one rolled-back session, which can't show two transactions racing.
+`live_client` builds an app with its own engine, so each request gets its own connection,
+locks really block and commits are visible to other requests. Requests are fired together
+with `asyncio.gather`, and `committed_sessions` checks the ledger invariant and truncates every
+table afterwards. The suite covers parallel duplicate creates, parallel refunds, parallel
+duplicate callbacks, parallel confirms, racing first postings that create ledger accounts, and
+a duplicate that times out waiting for an in-flight original.
