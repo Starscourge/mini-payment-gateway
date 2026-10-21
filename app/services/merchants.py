@@ -7,9 +7,9 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.errors import ApiKeyNotFound
+from app.errors import ApiKeyNotFound, UnprocessableEntity
 from app.models import ApiKey, Merchant
-from app.security import api_keys
+from app.security import api_keys, ssrf
 from app.security.signing import generate_webhook_secret
 
 _MAX_PREFIX_ATTEMPTS = 5
@@ -22,8 +22,18 @@ class IssuedApiKey:
 
 
 async def create_merchant(
-    session: AsyncSession, *, name: str, webhook_url: str | None
+    session: AsyncSession,
+    *,
+    name: str,
+    webhook_url: str | None,
+    url_policy: ssrf.UrlPolicy = ssrf.STRICT,
 ) -> tuple[Merchant, IssuedApiKey]:
+    if webhook_url is not None:
+        # Checked again before every delivery, since DNS can change after signup.
+        try:
+            await ssrf.pin(webhook_url, url_policy)
+        except ssrf.UnsafeUrl as exc:
+            raise UnprocessableEntity("invalid_webhook_url", f"webhook_url: {exc}.") from None
     merchant = Merchant(
         name=name, webhook_url=webhook_url, webhook_secret=generate_webhook_secret()
     )

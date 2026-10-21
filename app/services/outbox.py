@@ -137,6 +137,15 @@ def mark_done(event: OutboxEvent) -> None:
     event.last_error = None
 
 
+def requeue(event: OutboxEvent) -> None:
+    """Make a failed or dead event due now, with a fresh set of attempts."""
+    event.status = OutboxStatus.PENDING
+    event.attempts = 0
+    # The database's clock, because claim_next compares against the database's now(). (With
+    # eager_defaults, the flush reads the value back.)
+    event.next_attempt_at = func.now()
+
+
 def record_failure(event: OutboxEvent, error: str) -> None:
     """Schedule another attempt with exponential backoff, or give up after MAX_ATTEMPTS."""
     event.attempts += 1

@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     # rejected; required in production.
     bank_callback_secret: SecretStr | None = Field(default=None, min_length=16)
     payment_ttl_minutes: int = Field(default=15, ge=1, le=24 * 60)
+    # Requests per API key per minute (a fixed window counted in Redis).
+    rate_limit_per_minute: int = Field(default=100, ge=1)
+    # Lets webhook URLs point at private, loopback or link-local addresses, e.g. a receiver on
+    # this machine during local development. Refused in production.
+    webhook_allow_private_urls: bool = False
     log_level: Annotated[Literal["DEBUG", "INFO", "WARNING", "ERROR"], BeforeValidator(_upper)] = (
         "INFO"
     )
@@ -37,6 +42,8 @@ class Settings(BaseSettings):
                 raise ValueError("ADMIN_TOKEN must be set when ENVIRONMENT=production")
             if self.bank_callback_secret is None:
                 raise ValueError("BANK_CALLBACK_SECRET must be set when ENVIRONMENT=production")
+            if self.webhook_allow_private_urls:
+                raise ValueError("WEBHOOK_ALLOW_PRIVATE_URLS is not allowed in production")
         return self
 
 

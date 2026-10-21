@@ -5,12 +5,18 @@ from fastapi import APIRouter, Query
 
 from app.api.deps import CurrentMerchant, PaymentPathId, SessionDep, SettingsDep
 from app.api.idempotency import IdempotencyDep
+from app.api.rate_limit import RateLimited
 from app.models import PaymentStatus
 from app.schemas.common import error_responses
 from app.schemas.payments import CreatePaymentRequest, PaymentList, PaymentOut
 from app.services import payments as payments_service
 
-router = APIRouter(prefix="/v1/payments", tags=["Payments"], responses=error_responses(401))
+router = APIRouter(
+    prefix="/v1/payments",
+    tags=["Payments"],
+    dependencies=[RateLimited],
+    responses=error_responses(401, 429),
+)
 
 
 @router.post("", status_code=201, responses=error_responses(400, 409, 422))

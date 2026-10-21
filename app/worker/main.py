@@ -1,5 +1,5 @@
-"""The worker: drains the outbox, expires stale payments and purges old idempotency keys.
-Run with: python -m app.worker.main
+"""The worker: submits payments to the bank, delivers webhooks, expires stale payments and
+purges old idempotency keys. Run with: python -m app.worker.main
 
 Each outbox event is claimed, handled and recorded in its own transaction, so its row lock is
 held only for its own HTTP call, and one event's failure can't undo another's bookkeeping.
@@ -21,10 +21,11 @@ from app.config import Settings, get_settings
 from app.db import create_engine, create_session_factory
 from app.logging import configure_logging
 from app.models import OutboxKind
+from app.security.ssrf import UrlPolicy
 from app.services import outbox
 from app.worker.handlers import (
     Handler,
-    TransientError,
+    deliver_webhook,
     expire_payments,
     purge_idempotency_keys,
     submit_to_bank,
@@ -34,7 +35,7 @@ log = structlog.get_logger()
 
 POLL_INTERVAL_SECONDS = 1.0  # how long to wait when no event is due
 SWEEP_INTERVAL_SECONDS = 10.0
-BANK_TIMEOUT_SECONDS = 5.0  # the event's row lock is held for the call, so keep it short
+HTTP_TIMEOUT_SECONDS = 5.0  # the event's row lock is held for the call, so keep it short
 
 
 async def process_next_event(session: AsyncSession, handlers: Mapping[str, Handler]) -> bool:
@@ -46,21 +47,22 @@ async def process_next_event(session: AsyncSession, handlers: Mapping[str, Handl
 
     with structlog.contextvars.bound_contextvars(outbox_id=event.id, kind=event.kind):
         try:
-            # The savepoint undoes a failed handler's writes, but the outer transaction (and so
+            # The savepoint undoes a crashed handler's writes, but the outer transaction (and so
             # the event's row lock) survives, so the failure is recorded before anyone else can
             # claim the event.
             async with session.begin_nested():
-                await handlers[event.kind](session, event)
-        except TransientError as exc:
-            log.warning("outbox_event_failed", error=str(exc), attempt=event.attempts + 1)
-            outbox.record_failure(event, str(exc))
+                error = await handlers[event.kind](session, event)
         except Exception as exc:
             # A bug or a database error. Back off like any failure, so a bad event can't spin.
             log.exception("outbox_event_crashed", attempt=event.attempts + 1)
             outbox.record_failure(event, repr(exc))
         else:
-            outbox.mark_done(event)
-            log.info("outbox_event_done", attempt=event.attempts)
+            if error is None:
+                outbox.mark_done(event)
+                log.info("outbox_event_done", attempt=event.attempts)
+            else:
+                log.warning("outbox_event_failed", error=error, attempt=event.attempts + 1)
+                outbox.record_failure(event, error)
         await session.commit()
     return True
 
@@ -97,9 +99,17 @@ async def _main(settings: Settings) -> None:
         loop.add_signal_handler(signum, stop.set)
 
     engine = create_engine(settings)
-    async with httpx.AsyncClient(base_url=settings.bank_url, timeout=BANK_TIMEOUT_SECONDS) as bank:
-        # Webhook events wait in the outbox until milestone 4 adds their handler.
-        handlers: dict[str, Handler] = {OutboxKind.BANK_SUBMIT: partial(submit_to_bank, bank=bank)}
+    policy = UrlPolicy.for_settings(settings)
+    async with (
+        httpx.AsyncClient(base_url=settings.bank_url, timeout=HTTP_TIMEOUT_SECONDS) as bank,
+        # follow_redirects is already httpx's default; stated because a redirect could lead the
+        # request past the SSRF check to an internal address.
+        httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=False) as webhooks,
+    ):
+        handlers: dict[str, Handler] = {
+            OutboxKind.BANK_SUBMIT: partial(submit_to_bank, bank=bank),
+            OutboxKind.WEBHOOK: partial(deliver_webhook, http=webhooks, policy=policy),
+        }
         log.info("worker_started", kinds=sorted(handlers), bank_url=settings.bank_url)
         try:
             await run(create_session_factory(engine), handlers, stop)

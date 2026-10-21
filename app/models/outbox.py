@@ -27,6 +27,9 @@ class OutboxStatus(enum.StrEnum):
 
 class OutboxEvent(Base):
     __tablename__ = "outbox"
+    # Server-set columns (created_at, next_attempt_at) are shown in the delivery log; read them
+    # back on insert (see Payment).
+    __mapper_args__ = {"eager_defaults": True}  # noqa: RUF012
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     kind: Mapped[str]  # an OutboxKind
@@ -42,15 +45,32 @@ class OutboxEvent(Base):
 
 # Partial index: the worker only ever scans pending rows that are due.
 Index("outbox_due", OutboxEvent.next_attempt_at, postgresql_where=OutboxEvent.status == "pending")
+# A merchant's webhook events, newest first (GET /v1/webhook-events).
+Index(
+    "outbox_webhook_events",
+    OutboxEvent.merchant_id,
+    OutboxEvent.id.desc(),
+    postgresql_where=OutboxEvent.kind == "webhook",
+)
+# A webhook event's public ID (evt_...) lives in its payload, because that is what merchants
+# receive; this expression index makes it addressable for redelivery, and guarantees it unique.
+Index(
+    "outbox_event_id",
+    OutboxEvent.payload["id"].astext,
+    unique=True,
+    postgresql_where=OutboxEvent.kind == "webhook",
+)
 
 
 class WebhookDelivery(Base):
     """One row per delivery attempt, for the delivery log."""
 
     __tablename__ = "webhook_deliveries"
+    __mapper_args__ = {"eager_defaults": True}  # noqa: RUF012
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    outbox_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("outbox.id"))
+    # Indexed for listing an event's attempts.
+    outbox_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("outbox.id"), index=True)
     http_status: Mapped[int | None]
     duration_ms: Mapped[int | None]
     error: Mapped[str | None]
