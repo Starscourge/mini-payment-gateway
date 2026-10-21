@@ -1,3 +1,4 @@
+import uuid
 from datetime import timedelta
 from typing import Annotated
 
@@ -38,12 +39,26 @@ async def create_payment(
 async def get_payment(
     payment_id: str, merchant: CurrentMerchant, session: SessionDep
 ) -> PaymentOut:
-    payment_uuid = ids.parse_id(ids.PAYMENT, payment_id)
-    if payment_uuid is None:
-        raise PaymentNotFound()
     payment = await payments_service.get_payment(
-        session, merchant_id=merchant.merchant_id, payment_id=payment_uuid
+        session, merchant_id=merchant.merchant_id, payment_id=_parse_payment_id(payment_id)
     )
+    return PaymentOut.model_validate(payment)
+
+
+@router.post("/{payment_id}/confirm", responses=error_responses(404, 409))
+async def confirm_payment(
+    payment_id: str, merchant: CurrentMerchant, session: SessionDep
+) -> PaymentOut:
+    """Simulate the customer approving the payment.
+
+    The payment becomes `processing` and is queued for submission to the bank; the bank's
+    callback later makes it `succeeded` or `failed`. Fails with 409 unless the payment is
+    `created` and not yet expired.
+    """
+    payment = await payments_service.confirm_payment(
+        session, merchant_id=merchant.merchant_id, payment_id=_parse_payment_id(payment_id)
+    )
+    await session.commit()
     return PaymentOut.model_validate(payment)
 
 
@@ -62,3 +77,11 @@ async def list_payments(
     return PaymentList(
         data=[PaymentOut.model_validate(payment) for payment in payments], next_cursor=next_cursor
     )
+
+
+def _parse_payment_id(raw: str) -> uuid.UUID:
+    # A malformed ID gets the same 404 as an unknown one.
+    payment_id = ids.parse_id(ids.PAYMENT, raw)
+    if payment_id is None:
+        raise PaymentNotFound()
+    return payment_id

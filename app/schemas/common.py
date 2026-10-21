@@ -40,7 +40,7 @@ _ERROR_DESCRIPTIONS = {
     400: "Malformed request",
     401: "Missing, unknown or revoked credentials",
     404: "Not found, or owned by another merchant",
-    409: "Invalid state transition",
+    409: "Conflicts with the resource's current state",
     422: "Validation error",
 }
 

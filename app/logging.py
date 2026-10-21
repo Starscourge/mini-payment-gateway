@@ -18,7 +18,16 @@ log = structlog.get_logger()
 
 # Keys whose values must never reach the logs, whatever code logs them.
 _SENSITIVE_KEYS = frozenset(
-    {"authorization", "api_key", "admin_token", "x_admin_token", "webhook_secret", "password"}
+    {
+        "authorization",
+        "api_key",
+        "admin_token",
+        "x_admin_token",
+        "webhook_secret",
+        "bank_callback_secret",
+        "callback_secret",
+        "password",
+    }
 )
 # Incoming IDs are echoed into logs and headers, so accept only a safe alphabet.
 _REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,128}")
