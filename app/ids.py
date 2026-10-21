@@ -12,6 +12,7 @@ MERCHANT = "mer"
 API_KEY = "key"
 PAYMENT = "pay"
 REQUEST = "req"
+EVENT = "evt"
 
 _HEX32 = re.compile(r"[0-9a-f]{32}")
 

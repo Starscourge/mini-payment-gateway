@@ -50,6 +50,13 @@ class Payment(Base):
 
 # Supports newest-first cursor pagination per merchant.
 Index("payments_merchant_page", Payment.merchant_id, Payment.created_at.desc(), Payment.id.desc())
+# Partial index for the expiry sweep: it holds only unconfirmed payments, so it stays small however
+# many settled payments accumulate.
+Index(
+    "payments_expiry_due",
+    Payment.expires_at,
+    postgresql_where=Payment.status == PaymentStatus.CREATED,
+)
 
 
 class Refund(Base):

@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from redis.asyncio import Redis
 
-from app.api import health, merchants, payments
+from app.api import balance, bank_callbacks, health, merchants, payments
 from app.api.error_handlers import register_error_handlers
 from app.config import Settings, get_settings
 from app.db import create_engine, create_session_factory
@@ -42,4 +42,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(merchants.router)
     app.include_router(payments.router)
+    app.include_router(balance.router)
+    app.include_router(bank_callbacks.router)
     return app

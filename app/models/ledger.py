@@ -6,7 +6,7 @@ credits.
 
 import uuid
 
-from sqlalchemy import BigInteger, CheckConstraint, ForeignKey, UniqueConstraint
+from sqlalchemy import BigInteger, CheckConstraint, ForeignKey, Index, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, CreatedAt, UUIDPrimaryKey
@@ -33,11 +33,22 @@ class LedgerTransaction(Base):
     created_at: Mapped[CreatedAt]
 
 
+# Backstop for the duplicate-callback guard: a payment's capture can be posted only once, even if
+# application code has a bug. Refund transactions set refund_id, so they are not limited.
+Index(
+    "ledger_transactions_one_capture",
+    LedgerTransaction.payment_id,
+    unique=True,
+    postgresql_where=LedgerTransaction.refund_id.is_(None),
+)
+
+
 class LedgerEntry(Base):
     __tablename__ = "ledger_entries"
     __table_args__ = (CheckConstraint("amount_paise <> 0", name="amount_nonzero"),)
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     transaction_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("ledger_transactions.id"))
-    account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("ledger_accounts.id"))
+    # Indexed for balance queries, which sum one account's entries.
+    account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("ledger_accounts.id"), index=True)
     amount_paise: Mapped[int] = mapped_column(BigInteger)  # + debit, - credit
