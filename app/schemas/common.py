@@ -24,6 +24,7 @@ def _schema_for(prefix: str) -> WithJsonSchema:
 MerchantId = Annotated[UUID, _serialize_as(ids.MERCHANT), _schema_for(ids.MERCHANT)]
 ApiKeyId = Annotated[UUID, _serialize_as(ids.API_KEY), _schema_for(ids.API_KEY)]
 PaymentId = Annotated[UUID, _serialize_as(ids.PAYMENT), _schema_for(ids.PAYMENT)]
+RefundId = Annotated[UUID, _serialize_as(ids.REFUND), _schema_for(ids.REFUND)]
 
 
 class ErrorDetail(BaseModel):

@@ -18,7 +18,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import ids
-from app.models import LedgerAccount, LedgerEntry, LedgerTransaction, Payment
+from app.models import LedgerAccount, LedgerEntry, LedgerTransaction, Payment, Refund
 
 BANK_CLEARING = "bank_clearing"
 MERCHANT_BALANCE = "merchant_balance"
@@ -107,6 +107,26 @@ async def post_payment_succeeded(session: AsyncSession, payment: Payment) -> Led
         entries=[
             Entry(clearing, payment.amount_paise),
             Entry(merchant, -payment.amount_paise),
+        ],
+    )
+
+
+async def post_refund(session: AsyncSession, payment: Payment, refund: Refund) -> LedgerTransaction:
+    """The reverse of a capture, for the refunded amount: we owe the merchant less (debit), and
+    the bank owes us less (credit)."""
+    clearing = await account_id(session, merchant_id=None, code=BANK_CLEARING)
+    merchant = await account_id(session, merchant_id=payment.merchant_id, code=MERCHANT_BALANCE)
+    return await post(
+        session,
+        description=(
+            f"Refund {ids.format_id(ids.REFUND, refund.id)} of payment "
+            f"{ids.format_id(ids.PAYMENT, payment.id)}"
+        ),
+        payment_id=payment.id,
+        refund_id=refund.id,
+        entries=[
+            Entry(merchant, refund.amount_paise),
+            Entry(clearing, -refund.amount_paise),
         ],
     )
 
