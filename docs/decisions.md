@@ -259,3 +259,83 @@ with `asyncio.gather`, and `committed_sessions` checks the ledger invariant and 
 table afterwards. The suite covers parallel duplicate creates, parallel refunds, parallel
 duplicate callbacks, parallel confirms, racing first postings that create ledger accounts, and
 a duplicate that times out waiting for an in-flight original.
+
+## Milestone 4: Notifications and protection (2026-10-21)
+
+### 31. Webhook delivery: signed bytes, 2xx only, no redirects, body never read
+
+The worker's `webhook` handler serialises the event once, signs exactly those bytes with the
+merchant's secret (`X-Signature: t=…,v1=…`, the same scheme the bank's callbacks use), and POSTs
+them with a 5-second timeout. Only a 2xx answer counts as delivered. Redirects aren't followed,
+because a redirect could send the request to an address the SSRF check never saw, and the
+response body is never read, so a hostile endpoint can't make the worker download anything.
+Every attempt, failed or not, is a row in `webhook_deliveries` (status code, duration, error).
+Delivery is at least once: a timeout after the merchant processed the event means a retry, so
+merchants drop duplicates by the event's `evt_` ID, which never changes. Retries use the outbox
+backoff (30 s doubling to 6 h, ±20% jitter), and the event is `dead` after 10 attempts.
+
+### 32. Handlers return an error instead of raising
+
+Before, an expected failure raised, rolling back the handler's savepoint. A failed webhook
+attempt must still leave its `webhook_deliveries` row, so handlers now return `None` on success
+or a short error message on an expected failure, and their writes are kept either way. Only an
+exception (a bug, a database error) rolls back to the savepoint (decision 13).
+
+### 33. SSRF: every address must be public, checked at signup and before every attempt
+
+`app/security/ssrf.py` resolves the webhook URL's host and refuses it unless every address is
+public (`ipaddress.is_global`, which excludes private, loopback, link-local such as the cloud
+metadata address 169.254.169.254, carrier-grade NAT and reserved ranges). IPv4-mapped IPv6
+addresses (`::ffff:127.0.0.1`) are judged by the IPv4 address inside. "Every address" matters
+because a client may connect to any of them. Production also requires https.
+
+The check runs at signup (422 `invalid_webhook_url`) and again before every delivery, because
+DNS can change after signup. To close DNS rebinding, where a name resolves to a public IP for
+the check and a private one for the request, the request goes to the exact IP that was checked:
+the URL's host is replaced by that IP, and the original name is sent as the `Host` header and as
+the TLS server name (httpx's `sni_hostname` extension), so certificates are still verified against
+the hostname. I checked this against real HTTPS sites: the pinned request verifies, and the same
+request without the SNI extension fails with "IP address mismatch". `WEBHOOK_ALLOW_PRIVATE_URLS`
+relaxes the address check for local development, and Settings refuses it in production. Tests
+replace DNS with a fake resolver (the autouse `dns` fixture), so none depend on real lookups.
+
+### 34. An event for a merchant without a webhook URL is closed without an attempt
+
+Events are queued whatever the merchant's settings (decision 18). At delivery, an event for a
+merchant with no `webhook_url` has nowhere to go, so the worker marks it `done` with no delivery
+rows: `done` means "nothing left to do". The delivery log shows it with zero attempts.
+
+### 35. The delivery log and redelivery address events by their `evt_` ID
+
+A webhook event's public ID is the `id` inside its payload, since that is what merchants
+receive and deduplicate on. The partial unique expression index `outbox_event_id ON outbox
+((payload ->> 'id')) WHERE kind = 'webhook'` makes it addressable without a new column.
+`GET /v1/webhook-events` pages newest first by the outbox's increasing `id` (served by
+`outbox_webhook_events ON outbox (merchant_id, id DESC) WHERE kind = 'webhook'`), filters by
+status, and embeds each event's attempts. `POST /v1/webhook-events/{id}/redeliver` re-queues a
+pending or dead event with a fresh set of attempts; a delivered one is a 409, as the spec only
+re-queues failed or dead events. It takes the row lock, so it waits out a delivery in progress
+instead of racing it.
+
+"Due now" is the database's `now()`, not the app's clock: the worker compares `next_attempt_at`
+with the database's `now()`, and a test caught that an app timestamp slightly ahead of it delays
+the redelivery. `eager_defaults` on `OutboxEvent` reads the value back after the flush.
+
+### 36. Rate limiting: a fixed window per API key that fails open
+
+Each authenticated request runs `INCR rl:{key_prefix}:{minute}` plus `EXPIRE … 60 NX` in one
+Redis `MULTI`. Past `RATE_LIMIT_PER_MINUTE` (100) the answer is 429 `rate_limited` with
+`Retry-After` (seconds to the window's end), and every limited response carries
+`X-RateLimit-Limit` and `X-RateLimit-Remaining`. A fixed window allows a burst of up to twice the
+limit across a minute boundary; a sliding window would fix that at more cost. The limiter runs
+after authentication, because it counts per key: unauthenticated requests aren't counted (a
+per-IP limit would be the addition). Redis holds nothing but these counters, so if it's
+unreachable the limiter lets requests through and logs a warning, and the Redis client has
+half-second timeouts so a slow Redis can't stall the API. Tests pin the limiter's clock, so a
+real minute boundary can't split a test.
+
+### 37. Outbox rows and delivery attempts read back server-set columns
+
+`OutboxEvent` and `WebhookDelivery` now set `eager_defaults`, like `Payment` and `Refund`. Their
+server-set timestamps are shown in the delivery log, and reading them after an insert would
+otherwise need a lazy load, which `AsyncSession` can't do.
