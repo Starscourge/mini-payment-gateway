@@ -23,3 +23,13 @@ def test_local_runs_without_an_admin_token():
 
 def test_log_level_is_case_insensitive():
     assert Settings.model_validate({"log_level": "debug"}).log_level == "DEBUG"
+
+
+def test_production_requires_a_bank_callback_secret():
+    with pytest.raises(ValidationError, match="BANK_CALLBACK_SECRET"):
+        Settings.model_validate({"environment": "production", "admin_token": "x" * 16})
+
+
+def test_short_bank_callback_secret_is_rejected():
+    with pytest.raises(ValidationError, match="bank_callback_secret"):
+        Settings.model_validate({"bank_callback_secret": "short"})

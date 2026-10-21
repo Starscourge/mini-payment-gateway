@@ -6,30 +6,40 @@ inside a transaction that is rolled back afterwards, so tests never see each oth
 Unit tests use none of these fixtures and run without Docker.
 """
 
+import json
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 from alembic import command
 from alembic.config import Config as AlembicConfig
 from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, Response
+from pydantic import SecretStr
 from sqlalchemy import Connection, func, make_url, select, text
 from sqlalchemy.engine import URL
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.api.deps import get_session
 from app.config import Settings
 from app.main import create_app
-from app.models import LedgerEntry
+from app.models import Base, LedgerEntry
+from app.security.signing import signature_header
 
 ROOT = Path(__file__).resolve().parent.parent
 TEST_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL", "postgresql+asyncpg://gateway:gateway@localhost:5432/gateway_test"
 )
 TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/15")
+BANK_CALLBACK_SECRET = "test-bank-callback-secret"
 
 
 @pytest.fixture(scope="session")
@@ -40,9 +50,15 @@ def settings() -> Settings:
         database_url=TEST_DATABASE_URL,
         redis_url=TEST_REDIS_URL,
         admin_token=None,
+        bank_callback_secret=SecretStr(BANK_CALLBACK_SECRET),
         log_level="WARNING",
         log_format="console",
     )
+
+
+@pytest.fixture(scope="session")
+def bank_secret() -> str:
+    return BANK_CALLBACK_SECRET
 
 
 async def _create_database_if_missing(url: URL) -> None:
@@ -112,6 +128,23 @@ async def db_session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
 
 
 @pytest.fixture
+async def committed_sessions(
+    engine: AsyncEngine,
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    """Sessions that really commit, for tests where separate connections must see each
+    other's writes (row locks, SKIP LOCKED). Every table is emptied afterwards."""
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        yield factory
+        async with factory() as session:
+            await _assert_ledger_balanced(session)
+    finally:
+        tables = ", ".join(table.name for table in Base.metadata.sorted_tables)
+        async with engine.begin() as connection:
+            await connection.execute(text(f"TRUNCATE {tables} RESTART IDENTITY"))
+
+
+@pytest.fixture
 async def app(settings: Settings, db_session: AsyncSession) -> AsyncIterator[FastAPI]:
     app = create_app(settings)
 
@@ -169,3 +202,67 @@ def make_merchant(client: AsyncClient) -> MerchantFactory:
 @pytest.fixture
 async def merchant(make_merchant: MerchantFactory) -> MerchantAccount:
     return await make_merchant()
+
+
+PaymentFactory = Callable[..., Awaitable[dict[str, Any]]]
+
+
+@pytest.fixture
+def make_payment(client: AsyncClient, merchant: MerchantAccount) -> PaymentFactory:
+    """Create a payment through the API (for `merchant` unless `owner` is given), optionally
+    confirming it too."""
+
+    async def make(
+        owner: MerchantAccount | None = None, *, confirm: bool = False, **fields: Any
+    ) -> dict[str, Any]:
+        headers = (owner or merchant).headers
+        response = await client.post(
+            "/v1/payments", json={"amount_paise": 50_000} | fields, headers=headers
+        )
+        assert response.status_code == 201, response.text
+        payment: dict[str, Any] = response.json()
+        if confirm:
+            response = await client.post(f"/v1/payments/{payment['id']}/confirm", headers=headers)
+            assert response.status_code == 200, response.text
+            payment = response.json()
+        return payment
+
+    return make
+
+
+CallbackSender = Callable[..., Awaitable[Response]]
+
+
+@pytest.fixture
+def send_bank_callback(client: AsyncClient, bank_secret: str) -> CallbackSender:
+    """POST a bank callback signed the way the bank signs it. Overrides make it invalid."""
+
+    async def send(
+        payment_id: str,
+        status: str = "succeeded",
+        *,
+        bank_reference: str = "bnk_test_1",
+        failure_reason: str | None = None,
+        body: bytes | None = None,
+        secret: str | None = None,
+        timestamp: int | None = None,
+    ) -> Response:
+        raw = (
+            body
+            or json.dumps(
+                {
+                    "payment_id": payment_id,
+                    "bank_reference": bank_reference,
+                    "status": status,
+                    "failure_reason": failure_reason,
+                }
+            ).encode()
+        )
+        signature = signature_header(secret or bank_secret, raw, timestamp=timestamp)
+        return await client.post(
+            "/internal/bank/callback",
+            content=raw,
+            headers={"Content-Type": "application/json", "X-Signature": signature},
+        )
+
+    return send
