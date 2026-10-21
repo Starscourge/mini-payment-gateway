@@ -1,17 +1,24 @@
-# Local stack. `docker compose up --build` migrates the database and serves the API, with
-# Swagger at http://localhost:8000/docs. Milestone 2 adds the worker and mock_bank services.
+# Local stack. `docker compose up --build` migrates the database and starts the API (Swagger at
+# http://localhost:8000/docs), the worker and the mock bank.
 # Ports bind to 127.0.0.1 only: these dev credentials should not be reachable from the network.
 name: payment-gateway
+
+# Settings shared by the API and the worker, which run the same app code.
+x-app-env: &app-env
+  ENVIRONMENT: local
+  DATABASE_URL: postgresql+asyncpg://gateway:gateway@postgres:5432/gateway
+  REDIS_URL: redis://redis:6379/0
+  BANK_URL: http://mock-bank:8001
+  # Must match the mock bank's. A dev value: set a real secret in any deployment.
+  BANK_CALLBACK_SECRET: dev-only-bank-callback-secret
+  LOG_LEVEL: INFO
+  LOG_FORMAT: json
 
 services:
   api:
     build: .
     environment:
-      ENVIRONMENT: local
-      DATABASE_URL: postgresql+asyncpg://gateway:gateway@postgres:5432/gateway
-      REDIS_URL: redis://redis:6379/0
-      LOG_LEVEL: INFO
-      LOG_FORMAT: json
+      <<: *app-env
       RUN_MIGRATIONS: "1"
     ports:
       - "127.0.0.1:8000:8000"
@@ -30,6 +37,51 @@ services:
       timeout: 3s
       retries: 3
       start_period: 10s
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker.main"]
+    environment: *app-env
+    depends_on:
+      api:
+        condition: service_healthy # the api runs the migrations
+    restart: unless-stopped
+    stop_grace_period: 15s # finishes the event in hand (bank calls time out after 5 s)
+
+  # Named mock-bank, not mock_bank: underscores aren't valid in hostnames.
+  mock-bank:
+    build: .
+    command:
+      - uvicorn
+      - mock_bank.main:create_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8001"
+      - --no-access-log
+    environment:
+      BANK_CALLBACK_URL: http://api:8000/internal/bank/callback
+      BANK_CALLBACK_SECRET: dev-only-bank-callback-secret
+      BANK_FAILURE_RATE: "0.1"
+      BANK_DUPLICATE_RATE: "0.1"
+      BANK_LOST_RESPONSE_RATE: "0.05"
+      BANK_MIN_DELAY_SECONDS: "0.5"
+      BANK_MAX_DELAY_SECONDS: "3"
+      LOG_LEVEL: INFO
+      LOG_FORMAT: json
+    ports:
+      - "127.0.0.1:8001:8001"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=2)
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
 
   postgres:
     image: postgres:16
