@@ -1,4 +1,4 @@
-"""FastAPI dependencies: database session, settings and authentication."""
+"""FastAPI dependencies: database session, settings, authentication and path IDs."""
 
 import hmac
 import uuid
@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app import ids
 from app.config import Settings
-from app.errors import Unauthorized
+from app.errors import PaymentNotFound, Unauthorized
 from app.services import merchants as merchants_service
 
 
@@ -71,6 +71,19 @@ async def authenticate(
 
 
 CurrentMerchant = Annotated[AuthenticatedMerchant, Depends(authenticate)]
+
+
+def _payment_id_from_path(payment_id: str) -> uuid.UUID:
+    # A malformed ID gets the same 404 as an unknown one.
+    parsed = ids.parse_id(ids.PAYMENT, payment_id)
+    if parsed is None:
+        raise PaymentNotFound()
+    return parsed
+
+
+# The {payment_id} path parameter, parsed. Declare it after CurrentMerchant, so a request
+# without credentials gets 401 rather than 404.
+PaymentPathId = Annotated[uuid.UUID, Depends(_payment_id_from_path)]
 
 
 async def require_admin(

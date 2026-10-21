@@ -5,11 +5,14 @@ from sqlalchemy.exc import IntegrityError
 
 from app.ids import MERCHANT, PAYMENT, format_id, parse_id
 from app.models import Merchant, Payment, PaymentStatus
+from tests.helpers import idempotency_key
 
 
 async def create_payment(client, merchant, **overrides):
     body = {"amount_paise": 50_000, "currency": "INR", "description": "Order #1042"} | overrides
-    response = await client.post("/v1/payments", json=body, headers=merchant.headers)
+    response = await client.post(
+        "/v1/payments", json=body, headers=merchant.headers | idempotency_key()
+    )
     assert response.status_code == 201, response.text
     return response.json()
 
@@ -100,7 +103,9 @@ async def test_amount_limits_are_inclusive(client, merchant, amount):
     ],
 )
 async def test_create_payment_validates_input(client, merchant, body, field):
-    response = await client.post("/v1/payments", json=body, headers=merchant.headers)
+    response = await client.post(
+        "/v1/payments", json=body, headers=merchant.headers | idempotency_key()
+    )
     assert response.status_code == 422
     error = response.json()["error"]
     assert error["code"] == "validation_error"

@@ -1,4 +1,5 @@
-"""The worker: drains the outbox and expires stale payments. Run with: python -m app.worker.main
+"""The worker: drains the outbox, expires stale payments and purges old idempotency keys.
+Run with: python -m app.worker.main
 
 Each outbox event is claimed, handled and recorded in its own transaction, so its row lock is
 held only for its own HTTP call, and one event's failure can't undo another's bookkeeping.
@@ -21,7 +22,13 @@ from app.db import create_engine, create_session_factory
 from app.logging import configure_logging
 from app.models import OutboxKind
 from app.services import outbox
-from app.worker.handlers import Handler, TransientError, expire_payments, submit_to_bank
+from app.worker.handlers import (
+    Handler,
+    TransientError,
+    expire_payments,
+    purge_idempotency_keys,
+    submit_to_bank,
+)
 
 log = structlog.get_logger()
 
@@ -71,6 +78,7 @@ async def run(
             if time.monotonic() >= next_sweep:
                 async with session_factory() as session:
                     await expire_payments(session)
+                    await purge_idempotency_keys(session)
                 next_sweep = time.monotonic() + SWEEP_INTERVAL_SECONDS
             async with session_factory() as session:
                 busy = await process_next_event(session, handlers)

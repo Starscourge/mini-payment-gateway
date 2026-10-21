@@ -1,6 +1,7 @@
 """Render every error in the one shape: {"error": {"code", "message", "request_id"}}.
 
-Unhandled exceptions become 500s in RequestContextMiddleware (app/logging.py).
+Unhandled exceptions become 500s in RequestContextMiddleware (app/logging.py). The one
+non-error here is IdempotentReplay, which answers a retried request with its stored response.
 """
 
 from collections.abc import Mapping
@@ -12,6 +13,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.errors import AppError, error_payload
+from app.services.idempotency import IdempotentReplay
 
 _HTTP_ERROR_CODES = {404: "not_found", 405: "method_not_allowed"}
 
@@ -38,6 +40,13 @@ def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def handle_app_error(request: Request, exc: AppError) -> JSONResponse:
         return _error_response(request, exc.status_code, exc.code, exc.message, exc.headers)
+
+    @app.exception_handler(IdempotentReplay)
+    async def replay_stored_response(request: Request, exc: IdempotentReplay) -> JSONResponse:
+        # Not an error: a retry of a completed request gets the original response again.
+        return JSONResponse(
+            exc.body, status_code=exc.status_code, headers={"Idempotent-Replayed": "true"}
+        )
 
     @app.exception_handler(RequestValidationError)
     async def handle_validation_error(
