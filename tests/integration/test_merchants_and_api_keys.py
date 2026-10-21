@@ -155,3 +155,60 @@ async def test_revoking_an_unknown_key_id_is_404(client, merchant, key_id):
     response = await client.delete(f"/v1/api-keys/{key_id}", headers=merchant.headers)
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "api_key_not_found"
+
+
+@pytest.mark.parametrize(
+    ("webhook_url", "records", "reason"),
+    [
+        ("http://127.0.0.1:5432/", None, "private"),
+        ("http://169.254.169.254/latest/meta-data/", None, "private"),
+        ("http://[::1]/hooks", None, "private"),
+        ("http://localhost/hooks", ["127.0.0.1"], "private"),
+        ("https://internal.example/hooks", ["10.0.0.7"], "private"),
+        ("https://nowhere.invalid/hooks", None, "could not be resolved"),
+    ],
+)
+async def test_webhook_url_must_point_at_a_public_address(
+    client, dns, webhook_url, records, reason
+):
+    if records is not None:
+        dns[webhook_url.split("/")[2]] = records
+
+    response = await client.post("/v1/merchants", json={"name": "Acme", "webhook_url": webhook_url})
+
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "invalid_webhook_url"
+    assert reason in error["message"]
+
+
+async def test_production_requires_https_webhook_urls(app, client, settings):
+    app.state.settings = settings.model_copy(
+        update={"environment": "production", "admin_token": SecretStr("a" * 16)}
+    )
+    headers = {"X-Admin-Token": "a" * 16}
+
+    plain = await client.post(
+        "/v1/merchants",
+        json={"name": "Acme", "webhook_url": "http://shop.example/hooks"},
+        headers=headers,
+    )
+    secure = await client.post(
+        "/v1/merchants",
+        json={"name": "Acme", "webhook_url": "https://shop.example/hooks"},
+        headers=headers,
+    )
+
+    assert plain.status_code == 422
+    assert "https" in plain.json()["error"]["message"]
+    assert secure.status_code == 201
+
+
+async def test_private_webhook_urls_can_be_allowed_for_local_development(app, client, settings):
+    app.state.settings = settings.model_copy(update={"webhook_allow_private_urls": True})
+
+    response = await client.post(
+        "/v1/merchants", json={"name": "Acme", "webhook_url": "http://127.0.0.1:9000/hooks"}
+    )
+
+    assert response.status_code == 201

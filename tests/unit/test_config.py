@@ -33,3 +33,15 @@ def test_production_requires_a_bank_callback_secret():
 def test_short_bank_callback_secret_is_rejected():
     with pytest.raises(ValidationError, match="bank_callback_secret"):
         Settings.model_validate({"bank_callback_secret": "short"})
+
+
+def test_private_webhook_urls_are_refused_in_production():
+    with pytest.raises(ValidationError, match="WEBHOOK_ALLOW_PRIVATE_URLS"):
+        Settings.model_validate(
+            {
+                "environment": "production",
+                "admin_token": "x" * 16,
+                "bank_callback_secret": "y" * 16,
+                "webhook_allow_private_urls": True,
+            }
+        )
