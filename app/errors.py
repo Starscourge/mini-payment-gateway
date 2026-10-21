@@ -38,9 +38,18 @@ class UnprocessableEntity(AppError):
     status_code = 422
 
 
+class TooManyRequests(AppError):
+    status_code = 429
+
+
 class PaymentNotFound(NotFound):
     def __init__(self) -> None:
         super().__init__("payment_not_found", "No payment with that ID.")
+
+
+class WebhookEventNotFound(NotFound):
+    def __init__(self) -> None:
+        super().__init__("webhook_event_not_found", "No webhook event with that ID.")
 
 
 class ApiKeyNotFound(NotFound):

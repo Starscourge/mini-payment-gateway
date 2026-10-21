@@ -1,11 +1,14 @@
 from fastapi import APIRouter
 
 from app.api.deps import CurrentMerchant, SessionDep
+from app.api.rate_limit import RateLimited
 from app.schemas.balance import BalanceOut
 from app.schemas.common import error_responses
 from app.services import ledger
 
-router = APIRouter(prefix="/v1", tags=["Balance"], responses=error_responses(401))
+router = APIRouter(
+    prefix="/v1", tags=["Balance"], dependencies=[RateLimited], responses=error_responses(401, 429)
+)
 
 
 @router.get("/balance")

@@ -2,6 +2,7 @@ from fastapi import APIRouter
 
 from app.api.deps import CurrentMerchant, PaymentPathId, SessionDep
 from app.api.idempotency import IdempotencyDep
+from app.api.rate_limit import RateLimited
 from app.schemas.common import error_responses
 from app.schemas.refunds import CreateRefundRequest, RefundList, RefundOut
 from app.services import refunds as refunds_service
@@ -9,7 +10,8 @@ from app.services import refunds as refunds_service
 router = APIRouter(
     prefix="/v1/payments/{payment_id}/refunds",
     tags=["Refunds"],
-    responses=error_responses(401, 404),
+    dependencies=[RateLimited],
+    responses=error_responses(401, 404, 429),
 )
 
 

@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from redis.asyncio import Redis
 
-from app.api import balance, bank_callbacks, health, merchants, payments, refunds
+from app.api import balance, bank_callbacks, health, merchants, payments, refunds, webhook_events
 from app.api.error_handlers import register_error_handlers
 from app.config import Settings, get_settings
 from app.db import create_engine, create_session_factory
@@ -35,7 +35,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.engine = engine
     app.state.session_factory = create_session_factory(engine)
-    app.state.redis = Redis.from_url(settings.redis_url)
+    # Short timeouts: Redis only holds rate-limit counters, and the limiter fails open, so a
+    # slow or missing Redis must not stall requests.
+    app.state.redis = Redis.from_url(
+        settings.redis_url, socket_connect_timeout=0.5, socket_timeout=0.5
+    )
 
     app.add_middleware(RequestContextMiddleware)
     register_error_handlers(app)
@@ -43,6 +47,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(merchants.router)
     app.include_router(payments.router)
     app.include_router(refunds.router)
+    app.include_router(webhook_events.router)
     app.include_router(balance.router)
     app.include_router(bank_callbacks.router)
     return app

@@ -43,6 +43,7 @@ _ERROR_DESCRIPTIONS = {
     404: "Not found, or owned by another merchant",
     409: "Conflicts with the resource's current state",
     422: "Validation error",
+    429: "Rate limit exceeded; see the Retry-After header",
 }
 
 
