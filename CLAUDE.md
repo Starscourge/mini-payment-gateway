@@ -6,7 +6,7 @@ A FastAPI backend that simulates a small payment gateway (INR only, no real mone
 
 ## Current status
 
-**Milestones 1 (Foundation) and 2 (Money movement) are built.** Milestone 1 covers all 10 tables, merchants and API keys, create/get/list payments with the state machine, health checks, Docker Compose and CI; CI is green on GitHub (`Starscourge/mini-payment-gateway`, a public repo). Milestone 2 (branch `milestone-2-money-movement`) adds `POST /confirm` with the outbox, the worker (`bank_submit` handler and expiry sweep), the mock bank, signed bank callbacks, ledger postings and `GET /v1/balance`, and runs end to end in `docker compose up`.
+**Milestones 1 (Foundation) and 2 (Money movement) are built.** Milestone 1 covers all 10 tables, merchants and API keys, create/get/list payments with the state machine, health checks, Docker Compose and CI. Milestone 2 adds `POST /confirm` with the outbox, the worker (`bank_submit` handler and expiry sweep), the mock bank, signed bank callbacks, ledger postings and `GET /v1/balance`, and runs end to end in `docker compose up`. Both are merged into `main`, and CI is green on GitHub (`Starscourge/mini-payment-gateway`, a public repo).
 
 **Next is milestone 3 (Correctness under pressure):** idempotency keys on create, confirm and refunds; refunds with row locks (`app/services/refunds.py`, posting through `ledger.post` and queuing `refund.succeeded` events); concurrency, duplicate-callback and tenant-isolation tests that pass 50 runs in a row.
 
