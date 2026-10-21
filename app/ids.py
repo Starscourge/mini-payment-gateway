@@ -11,6 +11,7 @@ from uuid import UUID
 MERCHANT = "mer"
 API_KEY = "key"
 PAYMENT = "pay"
+REFUND = "rfd"
 REQUEST = "req"
 EVENT = "evt"
 

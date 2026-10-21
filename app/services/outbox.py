@@ -16,8 +16,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import ids
-from app.models import OutboxEvent, OutboxKind, OutboxStatus, Payment
+from app.models import OutboxEvent, OutboxKind, OutboxStatus, Payment, Refund
 from app.schemas.payments import PaymentOut
+from app.schemas.refunds import RefundOut
 
 log = structlog.get_logger()
 
@@ -60,27 +61,51 @@ def enqueue_bank_submission(session: AsyncSession, payment: Payment) -> OutboxEv
     )
 
 
-async def enqueue_payment_event(session: AsyncSession, payment: Payment) -> OutboxEvent:
-    """Queue a webhook announcing the payment's new status, e.g. ``payment.succeeded``.
+def _enqueue_webhook(
+    session: AsyncSession, *, merchant_id: uuid.UUID, event_type: str, data: dict[str, Any]
+) -> OutboxEvent:
+    """Queue a webhook event for the merchant.
 
-    The payload is a snapshot taken now, so the event describes the payment as it was when the
-    event happened, even if it changes before delivery. The event ID stays the same across
-    retries, which is what lets merchants drop duplicates. Delivery arrives in milestone 4;
-    until then these rows wait in the outbox.
+    `data` is a snapshot taken now, so the event describes the object as it was when the event
+    happened, even if it changes before delivery. The event ID stays the same across retries,
+    which is what lets merchants drop duplicates. Delivery arrives in milestone 4; until then
+    these rows wait in the outbox.
     """
-    await session.flush()  # writes the status change and reads back the new updated_at
-    event_type = f"payment.{payment.status}"
     return enqueue(
         session,
         kind=OutboxKind.WEBHOOK,
-        merchant_id=payment.merchant_id,
+        merchant_id=merchant_id,
         event_type=event_type,
         payload={
             "id": ids.format_id(ids.EVENT, uuid.uuid4()),
             "type": event_type,
             "created_at": datetime.now(UTC).isoformat(),
-            "data": PaymentOut.model_validate(payment).model_dump(mode="json"),
+            "data": data,
         },
+    )
+
+
+async def enqueue_payment_event(session: AsyncSession, payment: Payment) -> OutboxEvent:
+    """Announce the payment's new status, e.g. ``payment.succeeded``."""
+    await session.flush()  # writes the status change and reads back the new updated_at
+    return _enqueue_webhook(
+        session,
+        merchant_id=payment.merchant_id,
+        event_type=f"payment.{payment.status}",
+        data=PaymentOut.model_validate(payment).model_dump(mode="json"),
+    )
+
+
+async def enqueue_refund_event(
+    session: AsyncSession, refund: Refund, *, merchant_id: uuid.UUID
+) -> OutboxEvent:
+    """Announce a refund, e.g. ``refund.succeeded``."""
+    await session.flush()
+    return _enqueue_webhook(
+        session,
+        merchant_id=merchant_id,
+        event_type=f"refund.{refund.status}",
+        data=RefundOut.model_validate(refund).model_dump(mode="json"),
     )
 
 
