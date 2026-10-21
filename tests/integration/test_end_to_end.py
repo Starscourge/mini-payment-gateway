@@ -5,6 +5,7 @@ gateway once the worker has finished, because the app and the worker share one t
 which can't serve two requests at the same time.
 """
 
+import json
 import random
 from datetime import UTC, datetime
 from functools import partial
@@ -14,10 +15,12 @@ import pytest
 from sqlalchemy import update
 
 from app.models import OutboxEvent, OutboxKind
+from app.security.signing import verify_signature
+from app.security.ssrf import UrlPolicy
 from app.worker import main as worker
-from app.worker.handlers import submit_to_bank
+from app.worker.handlers import deliver_webhook, submit_to_bank
 from mock_bank.main import BankSettings, create_app
-from tests.helpers import confirm_payment
+from tests.helpers import confirm_payment, create_payment
 
 
 class Gateway:
@@ -163,3 +166,33 @@ async def test_lost_bank_reply_still_settles_once(
     assert len(bank.submissions) == 1
     assert (await get(client, merchant, f"/v1/payments/{payment['id']}"))["status"] == "succeeded"
     assert (await get(client, merchant, "/v1/balance"))["balance_paise"] == 30_000
+
+
+async def test_merchant_is_notified_when_its_payment_succeeds(
+    client, make_merchant, mock_bank, held, db_session
+):
+    shop = await make_merchant("Shop", webhook_url="https://shop.example/webhooks")
+    bank, handlers = await mock_bank()
+    received: list[httpx.Request] = []
+
+    def merchant_endpoint(request):
+        received.append(request)
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(merchant_endpoint)) as http:
+        policy = UrlPolicy(require_https=False, allow_private=False)
+        handlers = handlers | {
+            OutboxKind.WEBHOOK: partial(deliver_webhook, http=http, policy=policy)
+        }
+        payment = await create_payment(client, shop, confirm=True, amount_paise=25_000)
+
+        assert await worker.process_next_event(db_session, handlers)  # submits to the bank
+        await bank.drain()
+        await forward_callbacks(client, held)  # the bank settles it
+        assert await worker.process_next_event(db_session, handlers)  # notifies the merchant
+
+    (request,) = received
+    assert verify_signature(shop.webhook_secret, request.content, request.headers["X-Signature"])
+    event = json.loads(request.content)
+    assert event["type"] == "payment.succeeded"
+    assert (event["data"]["id"], event["data"]["status"]) == (payment["id"], "succeeded")

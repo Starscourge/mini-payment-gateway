@@ -6,6 +6,7 @@ inside a transaction that is rolled back afterwards, so tests never see each oth
 Unit tests use none of these fixtures and run without Docker.
 """
 
+import ipaddress
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
@@ -30,7 +31,14 @@ from app.api.deps import get_session
 from app.config import Settings
 from app.main import create_app
 from app.models import Base, LedgerEntry
-from tests.helpers import MerchantAccount, create_merchant, create_payment, post_bank_callback
+from app.security import ssrf
+from tests.helpers import (
+    PUBLIC_IP,
+    MerchantAccount,
+    create_merchant,
+    create_payment,
+    post_bank_callback,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 TEST_DATABASE_URL = os.environ.get(
@@ -57,6 +65,30 @@ def settings() -> Settings:
 @pytest.fixture(scope="session")
 def bank_secret() -> str:
     return BANK_CALLBACK_SECRET
+
+
+@pytest.fixture(autouse=True)
+def dns(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
+    """Fake DNS for the SSRF guard, so no test depends on real lookups.
+
+    Hostnames ending in .example resolve to PUBLIC_IP; IP literals resolve to themselves; any
+    other name fails to resolve. Tests can add or change records in the returned dict, e.g. to
+    point a merchant's hostname at a private address after signup (DNS rebinding).
+    """
+    records: dict[str, list[str]] = {}
+
+    async def resolve(host: str, port: int) -> list[str]:
+        if host in records:
+            return records[host]
+        if host.endswith(".example"):
+            return [PUBLIC_IP]
+        try:
+            return [str(ipaddress.ip_address(host))]
+        except ValueError:
+            raise ssrf.UnsafeUrl(f"the host {host!r} could not be resolved") from None
+
+    monkeypatch.setattr(ssrf, "resolve", resolve)
+    return records
 
 
 async def _create_database_if_missing(url: URL) -> None:
@@ -171,8 +203,8 @@ MerchantFactory = Callable[..., Awaitable[MerchantAccount]]
 
 @pytest.fixture
 def make_merchant(client: AsyncClient) -> MerchantFactory:
-    async def make(name: str = "Acme Stores") -> MerchantAccount:
-        return await create_merchant(client, name)
+    async def make(name: str = "Acme Stores", **fields: Any) -> MerchantAccount:
+        return await create_merchant(client, name, **fields)
 
     return make
 

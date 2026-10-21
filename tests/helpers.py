@@ -14,6 +14,10 @@ from httpx import AsyncClient, Response
 from app.ids import parse_id
 from app.security.signing import signature_header
 
+# A public address (example.com's) that fake .example hostnames resolve to (see the `dns`
+# fixture in conftest.py).
+PUBLIC_IP = "93.184.216.34"
+
 
 def to_uuid(public_id: str) -> uuid.UUID:
     """The UUID inside a public ID such as ``pay_8c1f...``, for calling services directly."""
@@ -39,8 +43,11 @@ class MerchantAccount:
         return {"Authorization": f"Bearer {self.api_key}"}
 
 
-async def create_merchant(client: AsyncClient, name: str = "Acme Stores") -> MerchantAccount:
-    response = await client.post("/v1/merchants", json={"name": name})
+async def create_merchant(
+    client: AsyncClient, name: str = "Acme Stores", **fields: Any
+) -> MerchantAccount:
+    """Create a merchant; `fields` adds e.g. webhook_url."""
+    response = await client.post("/v1/merchants", json={"name": name} | fields)
     assert response.status_code == 201, response.text
     body = response.json()
     return MerchantAccount(
