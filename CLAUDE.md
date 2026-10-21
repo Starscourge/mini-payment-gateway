@@ -6,16 +6,11 @@ A FastAPI backend that simulates a small payment gateway (INR only, no real mone
 
 ## Current status
 
-**Milestone 1 (Foundation) is built.** It covers all 10 tables and the first migration, merchants and API keys, create/get/list payments with the state machine, health checks, Docker Compose (api, postgres, redis) and CI. CI is green on GitHub (`Starscourge/mini-payment-gateway`, a public repo).
+**Milestones 1 (Foundation) and 2 (Money movement) are built.** Milestone 1 covers all 10 tables, merchants and API keys, create/get/list payments with the state machine, health checks, Docker Compose and CI; CI is green on GitHub (`Starscourge/mini-payment-gateway`, a public repo). Milestone 2 (branch `milestone-2-money-movement`) adds `POST /confirm` with the outbox, the worker (`bank_submit` handler and expiry sweep), the mock bank, signed bank callbacks, ledger postings and `GET /v1/balance`, and runs end to end in `docker compose up`.
 
-**Next is milestone 2 (Money movement):**
-- `mock_bank/` and the worker, with their Compose services
-- the outbox and `POST /confirm`
-- signed bank callbacks
-- ledger postings and `GET /v1/balance`
-- the expiry sweep
+**Next is milestone 3 (Correctness under pressure):** idempotency keys on create, confirm and refunds; refunds with row locks (`app/services/refunds.py`, posting through `ledger.post` and queuing `refund.succeeded` events); concurrency, duplicate-callback and tenant-isolation tests that pass 50 runs in a row.
 
-`POST /v1/payments` doesn't require an `Idempotency-Key` yet; that arrives with milestone 3. Follow the spec's "Project structure"; design choices so far are in `docs/decisions.md`. Update this section as milestones complete.
+No endpoint requires an `Idempotency-Key` yet; that arrives with milestone 3. Webhook outbox rows are already queued but nothing delivers them until milestone 4, so they sit `pending`. Follow the spec's "Project structure"; design choices so far are in `docs/decisions.md` (callbacks match by `payment_id`, a change agreed with the owner: decision 11). Update this section as milestones complete.
 
 ## Commands
 
@@ -26,6 +21,8 @@ uv sync                                  # install from uv.lock
 uv add <pkg>  /  uv add --dev <pkg>      # runtime / dev dependency (updates the lockfile)
 docker compose up -d postgres redis      # needed by integration tests, Alembic and the dev server
 uv run uvicorn app.main:create_app --factory --reload   # dev server on :8000, Swagger at /docs
+uv run python -m app.worker.main         # worker: drains the outbox, expires payments
+uv run uvicorn mock_bank.main:create_app --factory --port 8001   # mock bank (needs BANK_CALLBACK_SECRET)
 uv run ruff check . && uv run ruff format .
 uv run mypy .                            # strict; tests get relaxed signature rules
 uv run pytest                            # tests/unit alone needs no Docker
@@ -45,7 +42,7 @@ The test database is `gateway_test`. The test suite creates it and rebuilds its 
 for i in $(seq 50); do uv run pytest tests/integration/test_refunds.py -q -x || break; done
 ```
 
-The loop above is how concurrency tests are vetted: they must pass 50 runs in a row before they are trusted.
+The loop above is how concurrency tests are vetted: they must pass 50 runs in a row before they are trusted. Don't run two pytest processes at once: each run drops and rebuilds the `gateway_test` schema.
 
 ## Architecture
 
@@ -54,7 +51,8 @@ Three processes we write (API, worker, mock bank) plus PostgreSQL 16 and Redis 7
 - **The API never calls the bank or a merchant directly.** It writes the state change and an `outbox` row in one transaction; the worker polls the outbox with `FOR UPDATE SKIP LOCKED` and makes the HTTP call (5 s timeout).
 - **Postgres is the only source of truth.** Redis holds rate-limit counters only, which can be lost without harm. Never store business state in Redis.
 - **No job-queue library** (Celery, RQ, arq, Dramatiq). The Postgres outbox is a deliberate design choice.
-- **The mock bank is a separate FastAPI app** (`mock_bank/`) so failures and duplicate callbacks happen over a real network. In tests, replace it with a deterministic fake.
+- **The mock bank is a separate FastAPI app** (`mock_bank/`) so failures and duplicate callbacks happen over a real network. It is configured by `BANK_*` env vars (decline, duplicate-callback and lost-response rates, delays) and shares only `app/security/signing.py` with the gateway. In tests, the worker talks to a scripted fake (`httpx.MockTransport`, see `FakeBank` in `tests/integration/test_worker.py`); `tests/integration/test_end_to_end.py` runs the real mock bank in-process.
+- **The worker** claims one outbox row per transaction (`FOR UPDATE SKIP LOCKED`), runs its handler inside a savepoint, records the outcome and commits. Handlers are registered per `OutboxKind` in `app/worker/main.py`; it claims only kinds it has handlers for. Failures retry with backoff (30 s doubling to 6 h, ±20% jitter) and become `dead` after 10 attempts.
 - **Layering:** routers in `app/api/` stay thin. Business logic lives in `app/services/`, which must never import FastAPI, so the worker can reuse it and tests can call it directly. Services `flush()`, routers `commit()` (milestone 3 hands the transaction to the idempotency layer).
 - **Map of `app/`:**
   - `main.py`: `create_app()` factory; run with `--factory`
@@ -65,9 +63,17 @@ Three processes we write (API, worker, mock bank) plus PostgreSQL 16 and Redis 7
   - `ids.py`: prefixed public IDs
   - `api/deps.py`: session and settings dependencies, `CurrentMerchant` auth
   - `api/error_handlers.py`: renders errors in the one shape
+  - `api/bank_callbacks.py`: `POST /internal/bank/callback`, authenticated by HMAC, not an API key
+  - `services/payments.py`: the state machine and every flow that moves it (confirm, bank result, expiry)
+  - `services/ledger.py`: balanced postings, lazily created accounts, balances
+  - `services/outbox.py`: enqueue, `claim_next`, retry bookkeeping
+  - `security/signing.py`: `X-Signature` sign and verify (bank callbacks now, webhooks in milestone 4)
+  - `worker/main.py`: the polling loop and graceful shutdown; `worker/handlers.py`: what each event does
 
 Payment state machine (status only moves forward; refunds never change it):
 `created --confirm--> processing --bank success--> succeeded`, `processing --bank failure--> failed`, `created --past expires_at--> expired`.
+
+Settlement: `POST /confirm` sets `processing` and queues `bank_submit` → the worker POSTs to the bank, which replies 202 with a `bank_reference` → the bank's signed callback `{payment_id, bank_reference, status}` sets `succeeded`/`failed`, posts the ledger on success and queues a `payment.*` webhook event. Callbacks lock the payment **by `payment_id`**; whichever of the callback or the worker arrives first stores the reference, and a different one later is a 409. Ledger accounts: `bank_clearing` (system) is debited and the merchant's `merchant_balance` credited.
 
 ## Invariants (never break these)
 
@@ -104,7 +110,12 @@ Payment state machine (status only moves forward; refunds never change it):
 - **Fixtures:**
   - `client` calls the app
   - `merchant` / `make_merchant()` create merchants through the API (`.headers` holds their bearer auth)
+  - `make_payment(owner=None, confirm=False, **fields)` creates (and optionally confirms) a payment through the API
+  - `send_bank_callback(payment_id, status, ...)` posts a callback signed with the test bank secret; overrides make it invalid
   - `db_session` is the same session the app uses
+  - `committed_sessions` is a session factory that really commits, for tests that need several connections (row locks, `SKIP LOCKED`); it truncates every table afterwards
+  - `tests/helpers.py`: `to_uuid("pay_...")` for calling services directly with a public ID
+- **A failed request rolls back the shared test session**, including anything the test inserted through `db_session` without committing. Commit test setup first (`await db_session.commit()`, a savepoint release here) when the request under test is expected to fail.
 - The `db_session` fixture asserts the ledger invariant (every transaction sums to zero) after every integration test.
 - Coverage target is about 85% on `app/services/`.
 - Warnings are errors (`filterwarnings = ["error"]`), which catches un-awaited coroutines. If a third-party deprecation warning breaks the run, add a narrow `ignore:` entry rather than removing `error`.
@@ -124,3 +135,8 @@ Payment state machine (status only moves forward; refunds never change it):
 - **`astral-sh/setup-uv` has no floating major tags** (no `@v10`, unlike `actions/checkout@v7`). Pin an exact release such as `@v10.3.0`, and check that a tag exists before using it in CI.
 - **Listing routes:** in this FastAPI version, `app.routes` holds nested `_IncludedRouter` objects. Use `create_app().openapi()["paths"]` to list endpoints.
 - **`POST /v1/merchants`** is open when `ADMIN_TOKEN` is unset. Settings refuses to start with `ENVIRONMENT=production` and no token.
+- **Bank callbacks** are all rejected (401) while `BANK_CALLBACK_SECRET` is unset; production requires it. The API and the mock bank must share the value (Compose sets a dev one).
+- **Row locks need `populate_existing=True`** (see `_locked` in `app/services/payments.py`). `SELECT ... FOR UPDATE` alone doesn't refresh an object already in the session's identity map, so the lock would be held over stale values.
+- **`SUM(bigint)` is `NUMERIC`** in Postgres and comes back as `Decimal`. Cast sums of money back to `BigInteger` (see `ledger.merchant_balance`).
+- **`OutboxEvent` has no `eager_defaults`:** after inserting one, its server-set columns (`created_at`, `next_attempt_at`) aren't loaded, and reading them raises `MissingGreenlet`. Re-select it instead (with `populate_existing=True` if it's already in the session).
+- **Compose names the bank service `mock-bank`** (underscores aren't valid in hostnames), so `BANK_URL` is `http://mock-bank:8001`.
