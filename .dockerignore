@@ -1,4 +1,4 @@
-# The image needs only app code, migrations and the dependency manifests.
+# The image needs only app code, migrations, the demo script and the dependency manifests.
 .git
 .github
 .venv
