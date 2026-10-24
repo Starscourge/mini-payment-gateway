@@ -1,7 +1,7 @@
 [project]
 name = "mini-payment-gateway"
 version = "0.1.0"
-description = "Add your description here"
+description = "A payment gateway backend that keeps money records correct under retries, failures and concurrency"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -84,6 +84,7 @@ select = [
 "tests/**" = ["S101", "S105", "S106", "S311"]  # asserts, fake secrets, non-crypto random
 "mock_bank/**" = ["S311"]                       # random delays and failure rate are the point
 "loadtest/**" = ["S311"]
+"scripts/**" = ["T20"]                          # the demo narrates to a person
 
 [tool.ruff.lint.flake8-bugbear]
 extend-immutable-calls = [
