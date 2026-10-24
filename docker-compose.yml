@@ -1,6 +1,8 @@
 # Local stack. `docker compose up --build` migrates the database and starts the API (Swagger at
 # http://localhost:8000/docs), the worker and the mock bank.
 # Ports bind to 127.0.0.1 only: these dev credentials should not be reachable from the network.
+# If a port is taken on your machine (a local Postgres, say), pick another for this run:
+#   POSTGRES_HOST_PORT=55432 docker compose up --build
 name: payment-gateway
 
 # Settings shared by the API and the worker, which run the same app code.
@@ -11,7 +13,10 @@ x-app-env: &app-env
   BANK_URL: http://mock-bank:8001
   # Must match the mock bank's. A dev value: set a real secret in any deployment.
   BANK_CALLBACK_SECRET: dev-only-bank-callback-secret
-  RATE_LIMIT_PER_MINUTE: "100"
+  RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-100} # the load test raises it
+  # The demo's webhook receiver (scripts/demo.py) listens inside this network, on a private
+  # address. Local only: Settings refuses this in production.
+  WEBHOOK_ALLOW_PRIVATE_URLS: "true"
   LOG_LEVEL: INFO
   LOG_FORMAT: json
 
@@ -21,8 +26,9 @@ services:
     environment:
       <<: *app-env
       RUN_MIGRATIONS: "1"
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1} # uvicorn processes; the load test uses 4
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -72,7 +78,7 @@ services:
       LOG_LEVEL: INFO
       LOG_FORMAT: json
     ports:
-      - "127.0.0.1:8001:8001"
+      - "127.0.0.1:${BANK_HOST_PORT:-8001}:8001"
     healthcheck:
       test:
         - CMD
@@ -91,7 +97,7 @@ services:
       POSTGRES_PASSWORD: gateway
       POSTGRES_DB: gateway
     ports:
-      - "127.0.0.1:5432:5432" # for tests and Alembic run from the host
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432" # for tests and Alembic run from the host
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -103,7 +109,7 @@ services:
   redis:
     image: redis:7
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s

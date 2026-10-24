@@ -8,7 +8,7 @@ A FastAPI backend that simulates a small payment gateway (INR only, no real mone
 
 **Milestones 1 (Foundation), 2 (Money movement), 3 (Correctness under pressure) and 4 (Notifications and protection) are built.** Milestone 1 covers all 10 tables, merchants and API keys, create/get/list payments with the state machine, health checks, Docker Compose and CI. Milestone 2 adds `POST /confirm` with the outbox, the worker (`bank_submit` handler and expiry sweep), the mock bank, signed bank callbacks, ledger postings and `GET /v1/balance`, and runs end to end in `docker compose up`. Milestone 3 adds required `Idempotency-Key`s on create, confirm and refunds; refunds (`POST`/`GET /v1/payments/{id}/refunds`) under row locks; and concurrency, duplicate-callback and tenant-isolation tests that pass 50 runs in a row. Milestone 4 adds signed webhook delivery with retries, dead-lettering and a per-attempt log; `GET /v1/webhook-events` and `POST /v1/webhook-events/{id}/redeliver`; the SSRF guard on webhook URLs (at signup and before every delivery); and per-key rate limiting in Redis. All four are merged into `main`, and CI is green on GitHub (`Starscourge/mini-payment-gateway`, a public repo).
 
-**Next is milestone 5 (Ship it):** deployment over HTTPS; a README with the architecture diagram, design decisions and the live Swagger URL; a Locust run (`loadtest/locustfile.py`: create, confirm, poll until settled) with requests per second, p95 latency and the machine recorded; final CV bullets with only measured numbers. mypy strict is already on. Follow the spec's "Project structure"; design choices so far are in `docs/decisions.md` (callbacks match by `payment_id`, a change agreed with the owner: decision 11). Update this section as milestones complete.
+**Milestone 5 (Ship it) is built on the `milestone-5` branch, not yet merged.** The owner dropped the live deployment in favour of a one-command local run (decision 38, a change to the spec), so there is no hosting and no live Swagger URL. It adds the README (quickstart, Mermaid diagrams, design decisions, measured load-test results), `scripts/demo.py` (a narrated tour run inside the api container), the Locust scenario and its results, configurable Compose host ports, and a fix that keeps local variables (and with them the API key) out of logged tracebacks (decision 40). The final CV bullets use only measured numbers, from the README and the coverage run. Design choices are in `docs/decisions.md` (callbacks match by `payment_id`, a change agreed with the owner: decision 11). Known issue, not yet fixed: `GET /v1/webhook-events` can show an event's old fields next to its new delivery row (see Gotchas). Update this section as work completes.
 
 ## Commands
 
@@ -31,7 +31,12 @@ uv run alembic revision --autogenerate -m "msg"   # then review the file (see Go
 uv run alembic upgrade head
 uv run alembic check                     # fails if the models drifted from the migrations
 docker compose up --build                # full stack; the api container migrates on startup
+POSTGRES_HOST_PORT=55432 docker compose up --build   # if a host port is taken (also REDIS_/API_/BANK_HOST_PORT)
+docker compose exec api python -m scripts.demo   # the narrated tour, against the running stack
 docker compose exec postgres psql -U gateway gateway   # no psql/redis-cli on the host
+# Load test (README "Load test"): raise the per-key limit, optionally scale API processes and workers
+RATE_LIMIT_PER_MINUTE=1000000 WEB_CONCURRENCY=4 docker compose up --build -d --scale worker=3
+uv run locust -f loadtest/locustfile.py --host http://localhost:8000 --headless --users 200 --spawn-rate 50 --run-time 60s
 ```
 
 The test database is `gateway_test`. The test suite creates it and rebuilds its schema from the migrations on every run.
@@ -153,3 +158,7 @@ Settlement: `POST /confirm` sets `processing` and queues `bank_submit` → the w
 - **`lock_timeout` also covers unique-index waits** (SQLSTATE `55P03`, `exc.orig.sqlstate` on a SQLAlchemy `DBAPIError`). That is what bounds an idempotency duplicate's wait.
 - **No real DNS in tests:** the autouse `dns` fixture replaces `ssrf.resolve`. Hostnames ending in `.example` resolve to `PUBLIC_IP` (from `tests/helpers.py`), IP literals to themselves, anything else fails; add records to the fixture's dict to point a name elsewhere.
 - **Rate limits in tests:** each test's merchants have fresh API keys, so their counters start at zero. A test that counts requests must pin `rate_limit.clock` (see `tests/integration/test_rate_limit.py`), or a minute boundary can reset the count mid-test.
+- **Tracebacks are logged without local variables** (`app/logging.py`; decision 40). structlog's defaults include every frame's locals, and the request middleware's locals hold the `Authorization` header, which `_redact_secrets` can't see because it checks only top-level keys. Keep `show_locals=False` in both renderers; `tests/unit/test_logging.py` guards it.
+- **Two queries mean two snapshots:** under READ COMMITTED each statement sees what was committed when it started. `GET /v1/webhook-events` reads events, then their deliveries, so a worker commit in between can show an event's old fields (`attempts: 0`) next to its new delivery row. That's a known issue, not yet fixed. When polling it, wait on the event's own fields, as `scripts/demo.py` does.
+- **The Compose stack sets `WEBHOOK_ALLOW_PRIVATE_URLS=true`**, so the demo's receiver at `http://api:9000` passes the SSRF check. It is local only: Settings refuses it in production.
+- **`scripts/` ships in the image** (it isn't in `.dockerignore`), which is how `docker compose exec api python -m scripts.demo` finds it. Rebuild (`--build`) after editing the demo.

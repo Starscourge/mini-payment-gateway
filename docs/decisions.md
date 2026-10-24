@@ -339,3 +339,59 @@ real minute boundary can't split a test.
 `OutboxEvent` and `WebhookDelivery` now set `eager_defaults`, like `Payment` and `Refund`. Their
 server-set timestamps are shown in the delivery log, and reading them after an insert would
 otherwise need a lazy load, which `AsyncSession` can't do.
+
+## Milestone 5: Ship it (2026-10-24)
+
+### 38. No live deployment: the whole stack runs locally in one command
+
+The spec planned a hosted demo with a public Swagger URL. It was dropped, by agreement, in favour
+of a polished local setup. The project's readers are recruiters, who read the CV, and engineers,
+who read the code; very few would try a live API, and in an interview a laptop shows more (logs,
+the database, the worker) than a hosted demo can. A free host also fits poorly. The stack is five
+always-on processes, and the worker must keep polling. Free platform tiers sleep idle services
+and don't run background workers (Render, as of October 2026), or are trials (Fly.io, Railway),
+and the free VM option (Oracle's Always Free) can reclaim a server that looks idle, which a
+low-traffic demo does. A link that dies mid job search is worse than none.
+
+So `git clone` and `docker compose up --build` is the whole setup: Compose sets its own
+development secrets, and signup is open locally. Host ports are configurable
+(`POSTGRES_HOST_PORT=55432 docker compose up --build`), so a local Postgres or Redis already on
+the default port doesn't stop the stack. Deploying stays an option: the same Compose file behind
+a TLS-terminating proxy, with `ENVIRONMENT=production` and real secrets.
+
+### 39. A demo script, run inside the api container
+
+`scripts/demo.py` walks through signup, an idempotent retry, settlement, a webhook that fails and
+is redelivered, a refund, the balance and tenant isolation, narrating each step. It runs its own
+webhook receiver and checks signatures with `verify_signature`. It runs inside the api container
+(`docker compose exec api python -m scripts.demo`) because the worker must reach the receiver
+over the Compose network, and so a reader needs nothing but Docker. The receiver's address is
+private, so the local stack sets `WEBHOOK_ALLOW_PRIVATE_URLS=true`, which Settings refuses in
+production. To show a retry without waiting out the 30-second backoff, the receiver answers the
+first `payment.succeeded` delivery with 503 and the script asks for a redelivery.
+
+### 40. Tracebacks leave out local variables
+
+The load test turned up a leak: when a client disconnected mid-request, the crash log included
+every frame's local variables, as structlog's `dict_tracebacks` does by default. The middleware's
+locals hold the request headers, so the log line carried the plaintext API key, and it was about
+475 KB long. `_redact_secrets` couldn't help, because it checks only top-level keys. Tracebacks
+now keep file, line and function but no locals, in JSON (`ExceptionDictTransformer(show_locals=
+False)`) and in the console renderer used in development. `tests/unit/test_logging.py` crashes
+with a secret in a local variable and checks that it doesn't reach the output in either format.
+
+### 41. Load test: one merchant per user, settlement reported separately
+
+Each Locust user signs up as its own merchant, so the load spreads over many API keys, and the
+run raises `RATE_LIMIT_PER_MINUTE`, because it measures the gateway, not the limiter. Settlement
+time (confirm until a GET sees a final status) is logged apart from Locust's table: it is
+seconds of simulated bank delay, and mixing it in would distort the aggregate HTTP percentiles.
+
+What it showed: one uvicorn process is CPU-bound at about 100 requests a second. The API is
+stateless, so `WEB_CONCURRENCY=4` gives 2.5 times the throughput at a lower p95. At 200 users
+the single worker became the bottleneck: it handles one outbox event at a time and spends most of
+that time waiting on round trips, so the settlement median rose from 3.7 s to 9.3 s.
+`docker compose up --scale worker=3` brought it back to 3.5 s, and 2.4 times as many payments
+settled per minute, with no code change, because workers claim events with `FOR UPDATE SKIP
+LOCKED`. Afterwards every succeeded payment had exactly one ledger posting, and merchant balances
+matched payments minus refunds to the paisa. The numbers are in the README.
