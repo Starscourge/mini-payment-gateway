@@ -42,10 +42,22 @@ def _redact_secrets(_logger: WrappedLogger, _method: str, event_dict: EventDict)
 
 
 def configure_logging(level: str, *, json_logs: bool) -> None:
+    # Tracebacks leave out each frame's local variables, which structlog includes by default:
+    # they hold request headers (the API key) and secrets that _redact_secrets can't see, since
+    # it checks only top-level keys. They also made one crash log line hundreds of kilobytes.
     renderer: list[structlog.typing.Processor] = (
-        [structlog.processors.dict_tracebacks, structlog.processors.JSONRenderer()]
+        [
+            structlog.processors.ExceptionRenderer(
+                structlog.tracebacks.ExceptionDictTransformer(show_locals=False)
+            ),
+            structlog.processors.JSONRenderer(),
+        ]
         if json_logs
-        else [structlog.dev.ConsoleRenderer()]
+        else [
+            structlog.dev.ConsoleRenderer(
+                exception_formatter=structlog.dev.RichTracebackFormatter(show_locals=False)
+            )
+        ]
     )
     structlog.configure(
         processors=[
