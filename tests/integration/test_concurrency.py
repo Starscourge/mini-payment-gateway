@@ -2,7 +2,8 @@
 
 These use `live_client`: an app whose requests each get their own connection and really
 commit, unlike the rest of the suite, which shares one rolled-back session. Like every
-concurrency test here, they must pass 50 runs in a row (see CLAUDE.md).
+concurrency test here, they must pass 50 runs in a row (see the README's section on how
+correctness is tested).
 """
 
 import asyncio
